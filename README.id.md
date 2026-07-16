@@ -1,6 +1,13 @@
 # GhostChat
 
-[English](./README.md) · **Bahasa Indonesia**
+<p align="center">
+  <img src="docs/assets/cover.png" alt="GhostChat — Anonymous. Encrypted. Gone." width="100%" />
+</p>
+
+<p align="center">
+  <a href="./README.md">English</a> · <strong>Bahasa Indonesia</strong>
+  · <a href="https://github.com/tomzsh/ghostchat/releases/tag/v1.0.0">v1.0.0</a>
+</p>
 
 Chat 1:1 **anonim**, **ephemeral**, dan **terenkripsi end-to-end**.  
 Tanpa akun. Tanpa riwayat permanen. Tanpa plaintext di server.

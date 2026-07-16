@@ -199,6 +199,7 @@ Add unit tests next to packages when changing crypto or limits.
 | [.github/copilot-instructions.md](./.github/copilot-instructions.md) | GitHub Copilot |
 | [CLAUDE.md](./CLAUDE.md) | Claude Code pointer |
 | [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | Deeper system design |
+| [docs/assets/cover.png](./docs/assets/cover.png) | README cover image (source: `docs/cover.svg`) |
 
 ---
 
