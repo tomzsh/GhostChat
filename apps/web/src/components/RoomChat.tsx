@@ -1,0 +1,412 @@
+"use client";
+
+import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import type { TtlMode } from "@ghostchat/shared";
+import {
+  useGhostRoom,
+  type ChatMessage,
+  type RoomConnectionState,
+} from "@/hooks/useGhostRoom";
+import { canNativeShare, copyText, shareRoomCode } from "@/lib/share";
+import { RoomQr } from "./RoomQr";
+import { SafetyNumber } from "./SafetyNumber";
+import { TerminalFrame } from "./TerminalFrame";
+import { TypingAscii } from "./TypingAscii";
+
+const TTL_OPTIONS: {
+  value: TtlMode;
+  label: string;
+  short: string;
+  hint: string;
+}[] = [
+  {
+    value: "on_read",
+    label: "After read",
+    short: "read",
+    hint: "Burns shortly after the peer sees it",
+  },
+  {
+    value: "10s",
+    label: "10 seconds",
+    short: "10s",
+    hint: "Auto-delete ~10s after it appears",
+  },
+  {
+    value: "60s",
+    label: "60 seconds",
+    short: "60s",
+    hint: "Auto-delete ~60s after it appears",
+  },
+];
+
+function ttlShort(mode: TtlMode): string {
+  return TTL_OPTIONS.find((o) => o.value === mode)?.short ?? mode;
+}
+
+function statusLine(
+  state: RoomConnectionState,
+  peerId: string | null,
+  peerTyping: boolean
+): string {
+  switch (state) {
+    case "connecting":
+      return "Connecting…";
+    case "waiting_peer":
+      return "Waiting for peer…";
+    case "ready":
+      return peerTyping
+        ? `${peerId} typing…`
+        : `Connected · ${peerId ?? "peer"}`;
+    case "peer_left":
+      return "Peer left";
+    case "closed":
+      return "Room closed";
+    case "error":
+      return "Error";
+    default:
+      return state;
+  }
+}
+
+const MessageRow = memo(function MessageRow({ m }: { m: ChatMessage }) {
+  return (
+    <div
+      className={`rounded px-2 py-1.5 ${
+        m.mine ? "bg-ghost-green/5 ml-4 sm:ml-8" : "bg-white/[0.03] mr-4 sm:mr-8"
+      } ${m.burning ? "msg-burn" : ""}`}
+    >
+      <div className="mb-0.5 flex items-baseline justify-between gap-2">
+        <span className="text-[10px] text-ghost-dim sm:text-[11px]">
+          {m.mine ? "you" : m.from}
+        </span>
+        <span className="shrink-0 text-[9px] text-ghost-dim/50">
+          burn:{ttlShort(m.ttlMode)}
+        </span>
+      </div>
+      <p
+        className={`break-words text-[13px] leading-snug sm:text-sm ${
+          m.mine ? "text-ghost-green" : "text-white"
+        }`}
+      >
+        {m.text}
+      </p>
+    </div>
+  );
+});
+
+type Feedback = { kind: "ok" | "err"; text: string } | null;
+
+export function RoomChat({ roomId }: { roomId: string }) {
+  const router = useRouter();
+  const {
+    state,
+    myId,
+    peerId,
+    peerTyping,
+    meTyping,
+    messages,
+    ttlMode,
+    setTtlMode,
+    error,
+    safetyNumber,
+    sendMessage,
+    notifyTyping,
+    leaveRoom,
+    canSend,
+  } = useGhostRoom({ roomId });
+
+  const [draft, setDraft] = useState("");
+  const [feedback, setFeedback] = useState<Feedback>(null);
+  const [closing, setClosing] = useState(false);
+  const [supportsShare, setSupportsShare] = useState(false);
+  const [showQr, setShowQr] = useState(true);
+  const bottomRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const feedbackTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const ttlMeta = TTL_OPTIONS.find((o) => o.value === ttlMode);
+  const ttlHint = ttlMeta?.hint ?? "How long this message stays on screen";
+
+  useEffect(() => {
+    setSupportsShare(canNativeShare());
+  }, []);
+
+  // QR: show while waiting; hide when connected (user can re-open)
+  useEffect(() => {
+    if (state === "waiting_peer" || state === "peer_left") setShowQr(true);
+    if (state === "ready") setShowQr(false);
+  }, [state]);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [messages.length, peerTyping, meTyping, showQr]);
+
+  // Keep --app-height in sync with visual viewport (mobile keyboard / browser chrome)
+  useEffect(() => {
+    const setH = () => {
+      const h = window.visualViewport?.height ?? window.innerHeight;
+      document.documentElement.style.setProperty("--app-height", `${h}px`);
+    };
+    setH();
+    window.visualViewport?.addEventListener("resize", setH);
+    window.visualViewport?.addEventListener("scroll", setH);
+    window.addEventListener("resize", setH);
+    return () => {
+      window.visualViewport?.removeEventListener("resize", setH);
+      window.visualViewport?.removeEventListener("scroll", setH);
+      window.removeEventListener("resize", setH);
+    };
+  }, []);
+
+  const flash = useCallback((kind: "ok" | "err", text: string) => {
+    if (feedbackTimer.current) clearTimeout(feedbackTimer.current);
+    setFeedback({ kind, text });
+    feedbackTimer.current = setTimeout(() => setFeedback(null), 1600);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (feedbackTimer.current) clearTimeout(feedbackTimer.current);
+    };
+  }, []);
+
+  const onSubmit = useCallback(
+    (e: React.FormEvent) => {
+      e.preventDefault();
+      if (sendMessage(draft)) {
+        setDraft("");
+        notifyTyping(false);
+        // Keep focus for rapid mobile typing
+        requestAnimationFrame(() => inputRef.current?.focus());
+      }
+    },
+    [draft, sendMessage, notifyTyping]
+  );
+
+  const onCopyCode = useCallback(async () => {
+    const ok = await copyText(roomId);
+    flash(ok ? "ok" : "err", ok ? "Copied" : "Copy failed");
+  }, [roomId, flash]);
+
+  const onShare = useCallback(async () => {
+    const result = await shareRoomCode(roomId);
+    if (result === "shared") flash("ok", "Shared");
+    else if (result === "copied") flash("ok", "Copied");
+    else if (result === "failed") flash("err", "Share failed");
+  }, [roomId, flash]);
+
+  const onCloseRoom = useCallback(() => {
+    if (closing) return;
+    const needsConfirm = state !== "closed" && state !== "error";
+    if (
+      needsConfirm &&
+      !window.confirm("Close this room? Messages vanish from this device.")
+    ) {
+      return;
+    }
+    setClosing(true);
+    leaveRoom();
+    router.replace("/");
+  }, [closing, leaveRoom, router, state]);
+
+  const onDraftChange = useCallback(
+    (value: string) => {
+      setDraft(value);
+      if (value.length > 0) notifyTyping(true);
+      else notifyTyping(false);
+    },
+    [notifyTyping]
+  );
+
+  return (
+    <TerminalFrame
+      variant="app"
+      title={roomId}
+      hideFooterOnMobile
+      headerRight={
+        <button
+          type="button"
+          onClick={onCloseRoom}
+          disabled={closing}
+          className="chip chip--danger"
+          aria-label="Close room"
+        >
+          {closing ? "…" : "Close"}
+        </button>
+      }
+      footer={
+        <div className="flex items-center justify-between gap-2">
+          <span className="truncate">{myId ? `you: ${myId}` : "…"} · e2ee</span>
+          <span className="truncate text-ghost-dim">
+            {statusLine(state, peerId, peerTyping)}
+          </span>
+        </div>
+      }
+    >
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        {/* Compact toolbar */}
+        <div className="safe-x shrink-0 border-b border-ghost-border/60 px-2.5 py-2 sm:px-4">
+          <div className="flex items-center gap-1.5 overflow-x-auto pb-0.5 [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+            <button
+              type="button"
+              onClick={onCopyCode}
+              className="chip chip--active font-mono tracking-widest"
+              aria-label={`Copy room code ${roomId}`}
+            >
+              {roomId}
+            </button>
+            <button type="button" onClick={onCopyCode} className="chip">
+              copy
+            </button>
+            {supportsShare ? (
+              <button type="button" onClick={onShare} className="chip">
+                share
+              </button>
+            ) : null}
+            <button
+              type="button"
+              onClick={() => setShowQr((v) => !v)}
+              className={`chip ${showQr ? "chip--active" : ""}`}
+              aria-expanded={showQr}
+            >
+              QR
+            </button>
+          </div>
+
+          <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] sm:text-[11px]">
+            <span className="text-ghost-dim">
+              {statusLine(state, peerId, peerTyping)}
+            </span>
+            {state === "waiting_peer" && (
+              <span className="text-ghost-amber">Share code or QR</span>
+            )}
+            {state === "peer_left" && (
+              <span className="animate-pulse text-ghost-amber">
+                Waiting rejoin…
+              </span>
+            )}
+            {feedback ? (
+              <span
+                className={
+                  feedback.kind === "ok" ? "text-ghost-green" : "text-ghost-red"
+                }
+                role="status"
+              >
+                {feedback.text}
+              </span>
+            ) : null}
+          </div>
+        </div>
+
+        {/* QR — compact, only when open */}
+        {showQr ? (
+          <div className="shrink-0 border-b border-ghost-border/40 px-2.5 py-2 sm:px-4">
+            <RoomQr roomId={roomId} compact className="mx-auto w-full max-w-[200px]" />
+          </div>
+        ) : null}
+
+        {safetyNumber && state === "ready" ? (
+          <SafetyNumber value={safetyNumber} />
+        ) : null}
+
+        {/* Messages — takes remaining space */}
+        <div
+          className="chat-scroll min-h-0 flex-1 space-y-1.5 overflow-y-auto px-2.5 py-2 sm:space-y-2 sm:px-4 sm:py-3"
+          role="log"
+          aria-live="polite"
+        >
+          {messages.length === 0 ? (
+            <p className="px-1 py-4 text-center text-[11px] text-ghost-dim sm:text-xs">
+              {canSend
+                ? "Encrypted channel open — type below"
+                : "No messages yet"}
+            </p>
+          ) : null}
+          {messages.map((m) => (
+            <MessageRow key={m.id} m={m} />
+          ))}
+          <div ref={bottomRef} className="h-px" />
+        </div>
+
+        <TypingAscii
+          meTyping={meTyping && canSend}
+          peerTyping={peerTyping && canSend}
+          peerId={peerId}
+        />
+
+        {error ? (
+          <p
+            className="shrink-0 px-2.5 text-[11px] text-ghost-red sm:px-4 sm:text-xs"
+            role="alert"
+          >
+            ! {error}
+          </p>
+        ) : null}
+
+        {/* Composer — single owner of bottom safe area */}
+        <form
+          onSubmit={onSubmit}
+          className="safe-bottom shrink-0 border-t border-ghost-border bg-ghost-panel px-2.5 pt-2 sm:px-4 sm:pt-2.5"
+        >
+          <div className="mb-1.5 flex items-center gap-2">
+            <label
+              htmlFor="ttl"
+              className="shrink-0 text-[10px] font-medium text-ghost-green/90 sm:text-[11px]"
+            >
+              Burn
+            </label>
+            <select
+              id="ttl"
+              value={ttlMode}
+              onChange={(e) => setTtlMode(e.target.value as TtlMode)}
+              className="min-h-9 min-w-0 flex-1 touch-manipulation border border-ghost-border bg-ghost-bg px-2 text-[13px] text-ghost-green sm:min-h-8 sm:flex-none sm:text-xs"
+              title={ttlHint}
+              aria-describedby="ttl-hint"
+            >
+              {TTL_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+            {!canSend ? (
+              <span className="shrink-0 text-[10px] text-ghost-amber sm:text-[11px]">
+                locked
+              </span>
+            ) : null}
+          </div>
+          <p
+            id="ttl-hint"
+            className="mb-1.5 hidden text-[10px] leading-snug text-ghost-dim/70 sm:block sm:text-[11px]"
+          >
+            {ttlHint}
+          </p>
+          <div className="flex items-stretch gap-2">
+            <input
+              ref={inputRef}
+              value={draft}
+              onChange={(e) => onDraftChange(e.target.value)}
+              disabled={!canSend}
+              placeholder={canSend ? "Message…" : "Waiting for peer…"}
+              maxLength={2000}
+              enterKeyHint="send"
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="sentences"
+              spellCheck={false}
+              className="min-h-11 min-w-0 flex-1 touch-manipulation border border-ghost-border bg-ghost-bg px-3 text-base text-white placeholder:text-ghost-dim/45 disabled:opacity-40 focus:border-ghost-green sm:min-h-11 sm:text-sm"
+            />
+            <button
+              type="submit"
+              disabled={!canSend || !draft.trim()}
+              className="min-h-11 min-w-[4.25rem] shrink-0 touch-manipulation bg-ghost-green px-3 text-sm font-semibold text-black disabled:opacity-40 sm:min-w-[5rem]"
+            >
+              Send
+            </button>
+          </div>
+        </form>
+      </div>
+    </TerminalFrame>
+  );
+}

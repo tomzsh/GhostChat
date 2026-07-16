@@ -1,0 +1,15 @@
+node_modules
+dist
+dist-test
+.next
+.turbo
+.wrangler
+.dev.vars
+*.log
+.env
+.env.local
+.env*.local
+.DS_Store
+coverage
+*.tsbuildinfo
+.vercel

@@ -1,0 +1,230 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  --sat: env(safe-area-inset-top, 0px);
+  --sab: env(safe-area-inset-bottom, 0px);
+  --sal: env(safe-area-inset-left, 0px);
+  --sar: env(safe-area-inset-right, 0px);
+  /* Dynamic viewport — tracks mobile browser chrome / keyboard better */
+  --app-height: 100dvh;
+}
+
+html {
+  height: 100%;
+  height: -webkit-fill-available;
+  overscroll-behavior: none;
+}
+
+body {
+  min-height: 100%;
+  min-height: var(--app-height);
+  min-height: -webkit-fill-available;
+  margin: 0;
+  background: #0a0a0a;
+  color: #e5e5e5;
+  font-family: "JetBrains Mono", "IBM Plex Mono", ui-monospace, monospace;
+  -webkit-tap-highlight-color: transparent;
+  text-size-adjust: 100%;
+  /* Avoid bounce scrolling the whole page on iOS while chatting */
+  overflow-x: hidden;
+}
+
+/* Full-height app shell (room) */
+.app-shell {
+  height: var(--app-height);
+  max-height: var(--app-height);
+  overflow: hidden;
+}
+
+.terminal-grid {
+  background-image: linear-gradient(
+      rgba(51, 255, 102, 0.03) 1px,
+      transparent 1px
+    ),
+    linear-gradient(90deg, rgba(51, 255, 102, 0.03) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+@keyframes burn-out {
+  0% {
+    opacity: 1;
+    filter: none;
+  }
+  100% {
+    opacity: 0;
+    filter: blur(2px);
+  }
+}
+
+.msg-burn {
+  animation: burn-out 0.45s ease-out forwards;
+}
+
+.safe-top {
+  padding-top: max(0.375rem, var(--sat));
+  padding-left: max(0.5rem, var(--sal));
+  padding-right: max(0.5rem, var(--sar));
+}
+
+.safe-bottom {
+  padding-bottom: max(0.5rem, var(--sab));
+  padding-left: max(0.5rem, var(--sal));
+  padding-right: max(0.5rem, var(--sar));
+}
+
+/* Composer owns bottom inset; footer above it does not double-pad */
+.safe-x {
+  padding-left: max(0.5rem, var(--sal));
+  padding-right: max(0.5rem, var(--sar));
+}
+
+:focus-visible {
+  outline: 1px solid #33ff66;
+  outline-offset: 2px;
+}
+
+/* Chat scroll area */
+.chat-scroll {
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
+  scroll-behavior: smooth;
+}
+
+/* Typing dots */
+.typing-dot {
+  display: inline-block;
+  font-size: 6px;
+  animation: typing-bounce 1s ease-in-out infinite;
+  opacity: 0.35;
+  color: #33ff66;
+}
+.typing-dot:nth-child(2) {
+  animation-delay: 0.15s;
+}
+.typing-dot:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes typing-bounce {
+  0%,
+  80%,
+  100% {
+    opacity: 0.2;
+    transform: translateY(0);
+  }
+  40% {
+    opacity: 1;
+    transform: translateY(-3px);
+  }
+}
+
+.typing-ascii {
+  transition:
+    opacity 0.18s ease,
+    max-height 0.22s ease;
+  max-height: 7.5rem;
+  opacity: 1;
+  overflow: hidden;
+}
+
+@media (min-width: 640px) {
+  .typing-ascii {
+    max-height: 11rem;
+  }
+}
+
+.typing-ascii--out {
+  opacity: 0;
+  max-height: 0 !important;
+  pointer-events: none;
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  border-top-width: 0 !important;
+}
+
+.typing-ascii__art {
+  text-shadow: 0 0 8px rgba(51, 255, 102, 0.2);
+  animation: typing-glow 1.4s ease-in-out infinite alternate;
+  /* Horizontal scroll if ASCII wider than screen */
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+@keyframes typing-glow {
+  from {
+    filter: brightness(0.95);
+  }
+  to {
+    filter: brightness(1.08);
+  }
+}
+
+.typing-ascii__caption {
+  animation: caption-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes caption-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* Compact action chips */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 2.25rem;
+  padding: 0.35rem 0.65rem;
+  border: 1px solid #222;
+  font-size: 0.6875rem;
+  line-height: 1;
+  color: #6b7280;
+  background: transparent;
+  touch-action: manipulation;
+  white-space: nowrap;
+}
+
+.chip:active {
+  background: rgba(51, 255, 102, 0.08);
+}
+
+.chip--active {
+  border-color: rgba(51, 255, 102, 0.45);
+  color: #33ff66;
+}
+
+.chip--danger {
+  border-color: rgba(255, 68, 102, 0.55);
+  color: #ff4466;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .typing-dot,
+  .typing-ascii__art,
+  .typing-ascii__caption,
+  .msg-burn {
+    animation: none !important;
+  }
+  .typing-ascii {
+    transition: none;
+  }
+  .chat-scroll {
+    scroll-behavior: auto;
+  }
+}
+
+@media (pointer: coarse) {
+  button,
+  [type="submit"],
+  select {
+    cursor: pointer;
+  }
+}
