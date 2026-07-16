@@ -7,6 +7,8 @@ No accounts. No permanent history. No plaintext on the server.
 
 > Privacy by design: the server is only a **relay** for ciphertext. When a room is empty, its in-memory state is destroyed.
 
+**AI / coding agents:** start at **[AGENTS.md](./AGENTS.md)** (architecture map, hard rules, commands).
+
 ---
 
 ## Table of contents

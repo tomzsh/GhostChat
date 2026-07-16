@@ -7,6 +7,8 @@ Tanpa akun. Tanpa riwayat permanen. Tanpa plaintext di server.
 
 > Privacy by design: server hanya **relay** ciphertext. Saat room kosong, state in-memory dihancurkan.
 
+**AI / coding agents:** mulai dari **[AGENTS.md](./AGENTS.md)** (peta arsitektur, aturan keras, perintah).
+
 ---
 
 ## Daftar isi

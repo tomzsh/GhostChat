@@ -1,0 +1,27 @@
+---
+description: GhostChat monorepo rules for Cursor agents
+globs:
+  - "**/*"
+alwaysApply: true
+---
+
+# GhostChat
+
+Read `AGENTS.md` at the repo root before large changes.
+
+## Non-negotiables
+
+- Server is ciphertext-only relay (Cloudflare Worker + Durable Objects).
+- No message history storage. No private keys server-side.
+- Max 2 participants per room; session identity = `sessionToken`.
+- Protocol types: `packages/protocol`. Crypto: `packages/crypto`.
+- Use pnpm. After package edits: `pnpm build:packages`.
+- Verify with `pnpm typecheck` and `pnpm test` when possible.
+- Mobile-first web UI; do not break room `app-shell` / safe-area layout.
+- Prefer 127.0.0.1 for local worker WebSocket URLs.
+
+## Key files
+
+- `apps/worker/src/room.ts` — room lifecycle, join, relay
+- `apps/web/src/hooks/useGhostRoom.ts` — client E2EE + WS
+- `packages/protocol/src/index.ts` — wire format
