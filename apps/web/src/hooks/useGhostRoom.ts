@@ -303,8 +303,10 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
 
     switch (msg.type) {
       case "joined": {
-        void (async () => {
+        // Keep MLS bootstrap on the same queue as commits/encrypt
+        void enqueueMls(async () => {
           setMyId(msg.yourId);
+          myIdRef.current = msg.yourId;
           setError(null);
           if (msg.sessionToken) sessionSet(`session:${rid}`, msg.sessionToken);
           if (msg.yourId) sessionSet(`display:${rid}`, msg.yourId);
@@ -319,6 +321,8 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
             (msg.peerId
               ? [{ id: msg.peerId, publicKey: msg.peerPublicKey || "mls" }]
               : []);
+          // Sync ref immediately — setState is async and tryAddPending reads membersRef
+          membersRef.current = peers;
           setMembers(peers);
 
           let session =
@@ -335,8 +339,6 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
             // Restored group from cache
             persistMls(session);
             setState(peers.length > 0 ? "ready" : "waiting_peer");
-            // Still try to add any pending / process after KP from others
-            void tryAddPending();
           } else if (peers.length === 0) {
             session = await bootstrapGroup(session);
             persistMls(session);
@@ -347,7 +349,10 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
             broadcastKeyPackage();
             scheduleKeyPackageRetries();
           }
-        })();
+          // KP may have arrived while bootstrap ran — drain pending adds
+          // (nested enqueue is fine; runs after this job)
+          void tryAddPending();
+        });
         break;
       }
       case "peer_joined": {
@@ -358,7 +363,9 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
         };
         setMembers((prev) => {
           if (prev.some((m) => m.id === peer.id)) return prev;
-          return [...prev, peer];
+          const next = [...prev, peer];
+          membersRef.current = next;
+          return next;
         });
         setParticipantCount(msg.participantCount ?? 0);
         setError(null);
@@ -369,6 +376,7 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
         const leftId = msg.peerId;
         setMembers((prev) => {
           const next = prev.filter((m) => m.id !== leftId);
+          membersRef.current = next;
           if (next.length === 0) setState("waiting_peer");
           return next;
         });

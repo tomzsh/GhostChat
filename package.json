@@ -6,9 +6,21 @@
   "scripts": {
     "build:packages": "pnpm --filter @ghostchat/shared build && pnpm --filter @ghostchat/protocol build && pnpm --filter @ghostchat/crypto build",
     "build:web": "pnpm build:packages && pnpm --filter @ghostchat/web build",
-    "build": "pnpm build:web"
+    "build": "pnpm build:web",
+    "predev:web": "pnpm build:packages",
+    "predev:worker": "pnpm build:packages",
+    "predev:cli": "pnpm build:packages",
+    "dev:web": "pnpm --filter @ghostchat/web dev",
+    "dev:worker": "pnpm --filter @ghostchat/worker dev",
+    "dev:cli": "pnpm --filter @ghostchat/cli start",
+    "typecheck": "pnpm -r run typecheck",
+    "test": "pnpm build:packages && pnpm --filter @ghostchat/shared test && pnpm --filter @ghostchat/crypto test && pnpm --filter @ghostchat/worker test",
+    "clean": "rm -rf apps/web/.next node_modules/.cache packages/*/dist packages/*/dist-test && pnpm -r exec rm -rf dist .next dist-test 2>/dev/null; true",
+    "audit:local": "pnpm typecheck && pnpm test && pnpm --filter @ghostchat/web build"
   },
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "packageManager": "pnpm@10.8.0",
   "dependencies": {
     "next": "15.5.20"

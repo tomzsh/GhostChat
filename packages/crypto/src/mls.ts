@@ -237,7 +237,7 @@ export async function processCommitIfNeeded(
     return { session: next, applied: true };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    // Stale / already-applied commits (Welcome path or duplicate)
+    // Stale / already-applied commits (Welcome path or duplicate broadcast)
     if (
       /epoch too old/i.test(msg) ||
       /too old/i.test(msg) ||
@@ -247,8 +247,8 @@ export async function processCommitIfNeeded(
     ) {
       return { session, applied: false };
     }
-    // Keep group usable: treat unknown commit errors as non-fatal if we still
-    // have state (decrypt will fail later if truly desynced).
+    // Unknown failure: do not advance, do not throw (UI must not show join noise).
+    // Decrypt will surface real desync later.
     return { session, applied: false };
   }
 }
