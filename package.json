@@ -2,7 +2,7 @@
   "name": "ghostchat",
   "private": true,
   "version": "2.0.1",
-  "description": "Anonymous ephemeral E2EE chat",
+  "description": "Anonymous ephemeral E2EE chat — web, CLI, Cloudflare Workers",
   "scripts": {
     "build:packages": "pnpm --filter @ghostchat/shared build && pnpm --filter @ghostchat/protocol build && pnpm --filter @ghostchat/crypto build",
     "build:web": "pnpm build:packages && pnpm --filter @ghostchat/web build",
@@ -10,9 +10,6 @@
   },
   "engines": { "node": ">=20" },
   "packageManager": "pnpm@10.8.0",
-  "dependencies": {
-    "next": "15.5.20"
-  },
   "pnpm": {
     "overrides": {
       "next": "15.5.20",
