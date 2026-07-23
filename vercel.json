@@ -1,7 +1,5 @@
 {
-  "framework": "nextjs",
-  "rootDirectory": "apps/web",
-  "buildCommand": "cd ../.. && pnpm build:packages && cd apps/web && npx next build",
+  "buildCommand": "pnpm build:packages && pnpm --filter @ghostchat/web build",
   "installCommand": "pnpm install --frozen-lockfile",
-  "outputDirectory": ".next"
+  "outputDirectory": "apps/web/.next"
 }
