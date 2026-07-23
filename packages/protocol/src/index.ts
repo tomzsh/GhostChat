@@ -15,6 +15,12 @@ export type RoomClosedReason =
   | "max_age"
   | "empty";
 
+/** Peer identity + public key as seen on the wire */
+export type PeerInfo = {
+  id: string;
+  publicKey: string;
+};
+
 /** Client → Server */
 export type ClientMessage =
   | {
@@ -42,6 +48,19 @@ export type ClientMessage =
       type: "burn";
       messageId: string;
     }
+  /** Wrap room AEAD key for a specific peer (ECDH-encrypted). */
+  | {
+      v: typeof PROTOCOL_VERSION;
+      type: "key_share";
+      to: string;
+      ciphertext: string;
+      nonce: string;
+    }
+  /** Ask existing members to (re)send key_share to me. */
+  | {
+      v: typeof PROTOCOL_VERSION;
+      type: "key_request";
+    }
   | {
       v: typeof PROTOCOL_VERSION;
       type: "ping";
@@ -53,19 +72,27 @@ export type ServerMessage =
       v: typeof PROTOCOL_VERSION;
       type: "joined";
       yourId: string;
+      sessionToken: string;
+      maxParticipants: number;
+      participantCount: number;
+      /** All other members already in the room */
+      peers: PeerInfo[];
+      /** @deprecated first peer only — use peers[] */
       peerId: string | null;
       peerPublicKey: string | null;
-      sessionToken: string;
     }
   | {
       v: typeof PROTOCOL_VERSION;
       type: "peer_joined";
       peerId: string;
       peerPublicKey: string;
+      participantCount: number;
     }
   | {
       v: typeof PROTOCOL_VERSION;
       type: "peer_left";
+      peerId: string;
+      participantCount: number;
     }
   | {
       v: typeof PROTOCOL_VERSION;
@@ -89,6 +116,19 @@ export type ServerMessage =
     }
   | {
       v: typeof PROTOCOL_VERSION;
+      type: "key_share";
+      from: string;
+      to: string;
+      ciphertext: string;
+      nonce: string;
+    }
+  | {
+      v: typeof PROTOCOL_VERSION;
+      type: "key_request";
+      from: string;
+    }
+  | {
+      v: typeof PROTOCOL_VERSION;
       type: "error";
       code: ErrorCode;
       message?: string;
@@ -104,13 +144,24 @@ export type ServerMessage =
     };
 
 export type RoomStatusResponse =
-  | { status: "ok"; roomId: string; participantCount: number; full: boolean }
+  | {
+      status: "ok";
+      roomId: string;
+      participantCount: number;
+      maxParticipants: number;
+      full: boolean;
+    }
   | { status: "not_found" }
-  | { status: "full"; roomId: string };
+  | { status: "full"; roomId: string; maxParticipants?: number };
+
+export type CreateRoomRequest = {
+  maxParticipants?: number;
+};
 
 export type CreateRoomResponse = {
   roomId: string;
   wsUrl: string;
+  maxParticipants: number;
 };
 
 export function parseClientMessage(raw: unknown): ClientMessage | null {
@@ -156,6 +207,22 @@ export function parseClientMessage(raw: unknown): ClientMessage | null {
         type: "burn",
         messageId: msg.messageId,
       };
+    case "key_share":
+      if (
+        typeof msg.to !== "string" ||
+        typeof msg.ciphertext !== "string" ||
+        typeof msg.nonce !== "string"
+      )
+        return null;
+      return {
+        v: PROTOCOL_VERSION,
+        type: "key_share",
+        to: msg.to,
+        ciphertext: msg.ciphertext,
+        nonce: msg.nonce,
+      };
+    case "key_request":
+      return { v: PROTOCOL_VERSION, type: "key_request" };
     case "ping":
       return { v: PROTOCOL_VERSION, type: "ping" };
     default:
@@ -167,6 +234,5 @@ export function parseServerMessage(raw: unknown): ServerMessage | null {
   if (!raw || typeof raw !== "object") return null;
   const msg = raw as Record<string, unknown>;
   if (msg.v !== PROTOCOL_VERSION || typeof msg.type !== "string") return null;
-  // Trust shape from our server; clients still switch on type
   return msg as unknown as ServerMessage;
 }

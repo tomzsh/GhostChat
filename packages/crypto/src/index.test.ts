@@ -16,6 +16,9 @@ import {
   toBase64,
   fromBase64,
   safetyNumberFromKey,
+  generateRoomKey,
+  wrapRoomKeyForPeer,
+  unwrapRoomKeyFromPeer,
 } from "./index.ts";
 
 describe("X25519 key agreement", () => {
@@ -106,6 +109,30 @@ describe("safety number", () => {
     assert.equal(safetyNumberFromKey(k1), safetyNumberFromKey(k1b));
     assert.match(safetyNumberFromKey(k1), /^\d{5} \d{5} \d{5}$/);
     assert.notEqual(safetyNumberFromKey(k1), safetyNumberFromKey(k2));
+  });
+});
+
+describe("group room key wrap", () => {
+  it("wraps and unwraps room key between peers", () => {
+    const a = generateKeyPair();
+    const b = generateKeyPair();
+    const roomKey = generateRoomKey();
+    assert.equal(roomKey.length, 32);
+
+    const wrapped = wrapRoomKeyForPeer(
+      a.privateKey,
+      b.publicKey,
+      roomKey,
+      "GRP001"
+    );
+    const unwrapped = unwrapRoomKeyFromPeer(
+      b.privateKey,
+      a.publicKey,
+      wrapped.ciphertext,
+      wrapped.nonce,
+      "GRP001"
+    );
+    assert.deepEqual(unwrapped, roomKey);
   });
 });
 

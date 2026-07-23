@@ -6,9 +6,9 @@ This file is the **primary entrypoint** for automated coding agents (Cursor, Cla
 
 ## Project in one paragraph
 
-**GhostChat** is a monorepo for **anonymous, ephemeral, 1:1 end-to-end encrypted chat**. Clients: Next.js web + Node CLI. Backend: Cloudflare Worker + Durable Objects (ciphertext relay only — no message storage). Privacy principles override feature creep.
+**GhostChat** is a monorepo for **anonymous, ephemeral end-to-end encrypted chat** (1:1 and small groups). Clients: Next.js web + Node CLI. Backend: Cloudflare Worker + Durable Objects (ciphertext relay only — no message storage). Privacy principles override feature creep.
 
-**Version:** 1.0.0 · **Package manager:** pnpm 9 · **Node:** ≥ 20
+**Version:** 1.1.0 · **Package manager:** pnpm 9 · **Node:** ≥ 20
 
 ---
 
@@ -17,7 +17,7 @@ This file is the **primary entrypoint** for automated coding agents (Cursor, Cla
 1. **Never store message plaintext or private keys on the server.** Worker only relays ciphertext + presence metadata.
 2. **Never write chat history to Durable Object storage, D1, KV, or logs.** Storage may hold short-lived room meta/alarms only.
 3. **Do not add accounts, persistent identity, or multi-device sync** without an explicit product decision (conflicts with ephemeral design).
-4. **Do not implement group chat (>2) with plain multi-ECDH** — needs MLS/sender keys; out of MVP scope.
+4. **Group chat uses a shared room AEAD key** wrapped to each peer via pairwise ECDH (`key_share`). Not full MLS — do not claim post-compromise security for large groups. Creator sets `maxParticipants` (2–20).
 5. **Do not commit secrets:** `.env`, `.env.local`, `.dev.vars`, API keys, Cloudflare tokens.
 6. **Do not expand scope** into file sharing / push / moderation of ciphertext unless asked.
 7. Prefer **editing existing files** over new dependencies. Justify any new package.

@@ -3,6 +3,7 @@ import {
   isValidRoomId,
   normalizeRoomId,
   LIMITS,
+  clampMaxParticipants,
 } from "@ghostchat/shared";
 import { RoomDurableObject } from "./room";
 import { SlidingWindowLimiter, clientIp } from "./rateLimit";
@@ -20,7 +21,6 @@ const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-// Isolate-local limiters (reset on cold start — still useful against bursts)
 const createLimiter = new SlidingWindowLimiter(
   LIMITS.maxCreatesPerMinute,
   LIMITS.rateLimitWindowMs
@@ -38,10 +38,7 @@ function json(data: unknown, status = 200): Response {
 }
 
 function rateLimited(): Response {
-  return json(
-    { error: "rate_limited", code: "rate_limited" },
-    429
-  );
+  return json({ error: "rate_limited", code: "rate_limited" }, 429);
 }
 
 function getRoomStub(env: Env, roomId: string): DurableObjectStub {
@@ -61,12 +58,22 @@ export default {
     if (path === "/api/rooms" && request.method === "POST") {
       if (!createLimiter.allow(`create:${ip}`)) return rateLimited();
 
+      let maxParticipants: number = LIMITS.defaultMaxParticipants;
+      try {
+        const body = (await request.json()) as { maxParticipants?: unknown };
+        if (body && body.maxParticipants !== undefined) {
+          maxParticipants = clampMaxParticipants(body.maxParticipants);
+        }
+      } catch {
+        /* empty body OK */
+      }
+
       const roomId = generateRoomId();
       const stub = getRoomStub(env, roomId);
       await stub.fetch("https://do/init", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ roomId }),
+        body: JSON.stringify({ roomId, maxParticipants }),
       });
 
       const host = url.host;
@@ -77,6 +84,7 @@ export default {
       return json({
         roomId,
         wsUrl: `${wsOrigin.replace(/\/$/, "")}/ws/${roomId}`,
+        maxParticipants,
       });
     }
 
@@ -96,9 +104,7 @@ export default {
 
     const wsMatch = path.match(/^\/ws\/([A-Za-z0-9]+)$/);
     if (wsMatch) {
-      // Count WS upgrade attempts (bruteforce vector for room codes)
       if (!joinLimiter.allow(`join:${ip}`)) {
-        // For WS, return plain 429 (browsers surface as connection error)
         return new Response(JSON.stringify({ error: "rate_limited" }), {
           status: 429,
           headers: { "Content-Type": "application/json", ...CORS_HEADERS },

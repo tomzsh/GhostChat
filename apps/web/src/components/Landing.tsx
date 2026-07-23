@@ -2,22 +2,33 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { normalizeRoomId, isValidRoomId } from "@ghostchat/shared";
+import {
+  normalizeRoomId,
+  isValidRoomId,
+  LIMITS,
+  clampMaxParticipants,
+} from "@ghostchat/shared";
 import { createRoom, getRoomStatus } from "@/lib/api";
 import { RelayStatus } from "./RelayStatus";
 import { TerminalFrame } from "./TerminalFrame";
+
+const SIZE_PRESETS = [2, 3, 5, 8, 12, 20] as const;
 
 export function Landing() {
   const router = useRouter();
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [maxParticipants, setMaxParticipants] = useState<number>(
+    LIMITS.defaultMaxParticipants
+  );
 
   async function onCreate() {
     setBusy(true);
     setError(null);
     try {
-      const { roomId } = await createRoom();
+      const max = clampMaxParticipants(maxParticipants);
+      const { roomId } = await createRoom({ maxParticipants: max });
       router.push(`/r/${roomId}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Create failed");
@@ -42,7 +53,15 @@ export function Landing() {
         return;
       }
       if (status.status === "full" || (status.status === "ok" && status.full)) {
-        setError("Room is full (max 2)");
+        const cap =
+          status.status === "ok"
+            ? status.maxParticipants
+            : status.maxParticipants;
+        setError(
+          cap
+            ? `Room is full (max ${cap})`
+            : "Room is full"
+        );
         setBusy(false);
         return;
       }
@@ -58,7 +77,7 @@ export function Landing() {
       title="ghostchat"
       footer={
         <p className="leading-relaxed">
-          Zero-knowledge · E2EE · Ephemeral
+          Zero-knowledge · E2EE · Ephemeral · Groups
         </p>
       }
     >
@@ -73,19 +92,50 @@ export function Landing() {
             <br className="sm:hidden" /> Encrypted. Gone.
           </h1>
           <p className="mt-2 max-w-md text-xs leading-relaxed text-ghost-dim sm:mt-3 sm:text-sm">
-            1:1 chat in seconds. No accounts, no history. Room dies when you
-            leave.
+            1:1 or small group chat. No accounts, no history. Creator sets max
+            members.
           </p>
         </div>
 
         <div className="flex flex-col gap-2.5">
+          <div className="flex flex-col gap-1.5">
+            <label
+              htmlFor="max-users"
+              className="text-[11px] font-medium text-ghost-green/90 sm:text-xs"
+            >
+              Max members (creator limit)
+            </label>
+            <div className="flex flex-wrap gap-1.5">
+              {SIZE_PRESETS.filter((n) => n <= LIMITS.maxParticipantsCap).map(
+                (n) => (
+                  <button
+                    key={n}
+                    type="button"
+                    onClick={() => setMaxParticipants(n)}
+                    className={`chip min-w-[2.75rem] ${
+                      maxParticipants === n ? "chip--active" : ""
+                    }`}
+                  >
+                    {n}
+                    {n === 2 ? " · 1:1" : ""}
+                  </button>
+                )
+              )}
+            </div>
+            <p className="text-[10px] text-ghost-dim/80 sm:text-[11px]">
+              Room holds up to{" "}
+              <strong className="text-ghost-green">{maxParticipants}</strong>{" "}
+              people (including you). Cap {LIMITS.maxParticipantsCap}.
+            </p>
+          </div>
+
           <button
             type="button"
             disabled={busy}
             onClick={onCreate}
             className="min-h-12 w-full touch-manipulation bg-ghost-green px-5 py-3.5 text-sm font-semibold text-black transition-colors active:bg-ghost-green/80 disabled:opacity-50 sm:min-h-11 sm:w-auto sm:self-start sm:py-2.5"
           >
-            {busy ? "…" : "Create Room"}
+            {busy ? "…" : `Create Room · max ${maxParticipants}`}
           </button>
 
           <div className="flex items-center gap-3 py-0.5 text-[10px] uppercase tracking-wider text-ghost-dim">
@@ -129,32 +179,27 @@ export function Landing() {
         </div>
 
         <p className="text-[11px] leading-relaxed text-ghost-dim sm:text-xs">
-          Tip: create a room, then let your peer{" "}
-          <strong className="text-ghost-green">scan the QR</strong> with their
-          camera.
+          Tip: create a room, share the code or{" "}
+          <strong className="text-ghost-green">QR</strong>. All members use the
+          same room key (E2EE).
         </p>
 
         <details className="border border-ghost-border/60 p-3 text-xs text-ghost-dim">
-          <summary className="min-h-11 cursor-pointer touch-manipulation list-none py-1 text-ghost-dim [-webkit-tap-highlight-color:transparent] hover:text-white">
+          <summary className="min-h-11 cursor-pointer touch-manipulation list-none py-1 text-ghost-dim hover:text-white">
             What is protected / what is not
           </summary>
           <ul className="mt-2 list-disc space-y-1.5 pl-4 leading-relaxed">
             <li>
-              Protected: message contents (E2EE), no permanent server storage,
-              no accounts.
+              Protected: message contents (E2EE group room key), no permanent
+              server storage, no accounts.
             </li>
             <li>
               Not protected: compromised devices, sharing the room code with the
-              wrong person, endpoint malware.
+              wrong people.
             </li>
             <li>
-              The room code is the access credential — share it only over a
-              trusted channel.
-            </li>
-            <li>
-              After connect, compare the{" "}
-              <strong className="text-white">safety number</strong> with your
-              peer.
+              Compare the <strong className="text-white">safety number</strong>{" "}
+              after connect — all members should match.
             </li>
           </ul>
         </details>

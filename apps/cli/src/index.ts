@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
  * GhostChat CLI — `ghost create` | `ghost join <ROOM_ID>`
+ * Supports 1:1 and small groups (shared room key).
  */
 import WebSocket from "ws";
 import * as readline from "node:readline";
@@ -8,7 +9,9 @@ import {
   decryptFromWire,
   encryptToWire,
   generateKeyPair,
-  deriveSharedKey,
+  generateRoomKey,
+  wrapRoomKeyForPeer,
+  unwrapRoomKeyFromPeer,
   publicKeyToBase64,
   publicKeyFromBase64,
   safetyNumberFromKey,
@@ -17,6 +20,7 @@ import {
   PROTOCOL_VERSION,
   parseServerMessage,
   type ServerMessage,
+  type PeerInfo,
 } from "@ghostchat/protocol";
 import {
   generateDisplayId,
@@ -26,6 +30,8 @@ import {
   normalizeRoomId,
   parseTtlMs,
   randomChars,
+  clampMaxParticipants,
+  LIMITS,
   type TtlMode,
 } from "@ghostchat/shared";
 import * as ui from "./ui.js";
@@ -36,41 +42,59 @@ const WEB_ORIGIN = process.env.GHOST_WEB_URL ?? "http://127.0.0.1:3000";
 
 function usage(): never {
   process.stdout.write(ui.banner());
-  console.log(ui.box("USAGE", [
-    ui.c.white("ghost create") + ui.c.dim(" [--ttl 10s|60s|on_read]"),
-    ui.c.white("ghost join") + ui.c.dim(" <ROOM_ID>"),
-    "",
-    ui.c.dim("env  GHOST_API_URL  GHOST_WS_URL  GHOST_WEB_URL"),
-    ui.c.dim(`def  ${API_BASE}`),
-  ]));
+  console.log(
+    ui.box("USAGE", [
+      ui.c.white("ghost create") +
+        ui.c.dim(" [--ttl 10s|60s|on_read] [--max N]"),
+      ui.c.white("ghost join") + ui.c.dim(" <ROOM_ID>"),
+      "",
+      ui.c.dim(`max members  ${LIMITS.minMaxParticipants}–${LIMITS.maxParticipantsCap} (default ${LIMITS.defaultMaxParticipants})`),
+      ui.c.dim(`env  GHOST_API_URL  GHOST_WS_URL  GHOST_WEB_URL`),
+    ])
+  );
   console.log("");
   process.exit(1);
 }
 
-async function createRoom(): Promise<{ roomId: string }> {
-  const res = await fetch(`${API_BASE}/api/rooms`, { method: "POST" });
+async function createRoom(maxParticipants: number): Promise<{
+  roomId: string;
+  maxParticipants: number;
+}> {
+  const res = await fetch(`${API_BASE}/api/rooms`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ maxParticipants }),
+  });
   if (!res.ok) throw new Error(`Create failed: ${res.status}`);
-  return res.json() as Promise<{ roomId: string }>;
+  return res.json() as Promise<{ roomId: string; maxParticipants: number }>;
 }
 
 async function checkRoom(roomId: string): Promise<void> {
   const res = await fetch(`${API_BASE}/api/rooms/${roomId}`);
   if (res.status === 404) throw new Error("Room not found");
   if (res.status === 429) throw new Error("Rate limited — try again shortly");
-  const body = (await res.json()) as { status: string; full?: boolean };
+  const body = (await res.json()) as {
+    status: string;
+    full?: boolean;
+    maxParticipants?: number;
+  };
   if (body.status === "not_found") throw new Error("Room not found");
-  if (body.full) throw new Error("Room is full (max 2)");
+  if (body.full)
+    throw new Error(
+      `Room is full${body.maxParticipants ? ` (max ${body.maxParticipants})` : ""}`
+    );
 }
 
 async function runSession(roomId: string, defaultTtl: TtlMode) {
   const keyPair = generateKeyPair();
   const displayId = generateDisplayId();
   const sessionToken = randomChars(24);
-  let sharedKey: Uint8Array | null = null;
+  let roomKey: Uint8Array | null = null;
   let safetyNumber: string | null = null;
   let myId = displayId;
-  let peerId: string | null = null;
-  let peerOnline = false;
+  const members = new Map<string, string>(); // id -> publicKey
+  let maxParticipants: number = 2;
+  let participantCount = 1;
   let ttlMode: TtlMode = defaultTtl;
   const burnTimers = new Map<string, NodeJS.Timeout>();
   let cleaned = false;
@@ -84,22 +108,124 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
     terminal: true,
   });
 
+  function hasPeers() {
+    return members.size > 0;
+  }
+
+  function canSend() {
+    return !!roomKey && hasPeers();
+  }
+
   function paintStatus() {
+    const peerList =
+      members.size === 0
+        ? ui.c.gray("none")
+        : [...members.keys()].map((id) => ui.c.cyan(id)).join(ui.c.dim(", "));
     ui.printLine(
-      ui.statusBar({
-        roomId,
-        myId,
-        peerId,
-        peerOnline,
-        ttl: ttlMode,
-      })
+      ui.c.dim("  room ") +
+        ui.c.bold(ui.c.brightGreen(roomId)) +
+        ui.c.dim("  you ") +
+        ui.c.cyan(myId) +
+        ui.c.dim(`  ${participantCount}/${maxParticipants}`) +
+        ui.c.dim("  peers ") +
+        peerList +
+        ui.c.dim("  burn ") +
+        ui.c.yellow(ttlMode)
     );
   }
 
   function setPrompt() {
-    const ready = peerOnline && !!sharedKey;
-    rl.setPrompt(ui.promptStr({ ttl: ttlMode, ready }));
+    rl.setPrompt(
+      ui.promptStr({ ttl: ttlMode, ready: canSend() })
+    );
     rl.prompt(true);
+  }
+
+  function setRoomKey(key: Uint8Array) {
+    roomKey = key;
+    safetyNumber = safetyNumberFromKey(key);
+    clearKeyRequestRetries();
+  }
+
+  const keyShareRetryTimers = new Map<string, NodeJS.Timeout[]>();
+  let keyRequestTimers: NodeJS.Timeout[] = [];
+  const KEY_SHARE_RETRY_MS = [0, 600, 1800, 4000];
+  const KEY_REQUEST_RETRY_MS = [400, 1200, 2800, 5500, 9000];
+
+  function clearKeyShareRetries(peerId?: string) {
+    if (peerId) {
+      const list = keyShareRetryTimers.get(peerId);
+      if (list) {
+        list.forEach(clearTimeout);
+        keyShareRetryTimers.delete(peerId);
+      }
+      return;
+    }
+    for (const list of keyShareRetryTimers.values()) list.forEach(clearTimeout);
+    keyShareRetryTimers.clear();
+  }
+
+  function clearKeyRequestRetries() {
+    keyRequestTimers.forEach(clearTimeout);
+    keyRequestTimers = [];
+  }
+
+  function shareKeyWith(id: string, publicKey: string) {
+    if (!roomKey || ws.readyState !== WebSocket.OPEN) return;
+    try {
+      const wire = wrapRoomKeyForPeer(
+        keyPair.privateKey,
+        publicKeyFromBase64(publicKey),
+        roomKey,
+        roomId
+      );
+      ws.send(
+        JSON.stringify({
+          v: PROTOCOL_VERSION,
+          type: "key_share",
+          to: id,
+          ciphertext: wire.ciphertext,
+          nonce: wire.nonce,
+        })
+      );
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** Share room key + retries (peer may miss the first packet). */
+  function shareKeyWithRetry(id: string, publicKey: string) {
+    clearKeyShareRetries(id);
+    const timers: NodeJS.Timeout[] = [];
+    for (const delay of KEY_SHARE_RETRY_MS) {
+      const t = setTimeout(() => {
+        if (!roomKey || !members.has(id)) return;
+        shareKeyWith(id, publicKey);
+      }, delay);
+      timers.push(t);
+    }
+    keyShareRetryTimers.set(id, timers);
+  }
+
+  function requestRoomKey() {
+    if (roomKey || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(
+      JSON.stringify({
+        v: PROTOCOL_VERSION,
+        type: "key_request",
+      })
+    );
+  }
+
+  function scheduleKeyRequests() {
+    clearKeyRequestRetries();
+    if (roomKey) return;
+    for (const delay of KEY_REQUEST_RETRY_MS) {
+      const t = setTimeout(() => {
+        if (!roomKey) requestRoomKey();
+      }, delay);
+      keyRequestTimers.push(t);
+    }
   }
 
   function burn(id: string) {
@@ -146,71 +272,104 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
     burnTimers.set(messageId, t);
   }
 
-  function onChannelReady(peer: string, peerPk: string) {
-    sharedKey = deriveSharedKey(
-      keyPair.privateKey,
-      publicKeyFromBase64(peerPk),
-      roomId
-    );
-    safetyNumber = safetyNumberFromKey(sharedKey);
-    peerId = peer;
-    peerOnline = true;
-    ui.ok(
-      ui.c.white("channel open · peer ") + ui.c.cyan(peer)
-    );
-    if (safetyNumber) {
-      process.stdout.write(ui.safetyCard(safetyNumber));
-    }
-    paintStatus();
-  }
-
   function handleServer(msg: ServerMessage) {
     switch (msg.type) {
       case "joined":
         myId = msg.yourId;
+        maxParticipants = msg.maxParticipants ?? 2;
+        participantCount = msg.participantCount ?? 1;
         ui.ok(ui.c.dim("connected as ") + ui.c.cyan(myId));
-        if (msg.peerId && msg.peerPublicKey) {
-          onChannelReady(msg.peerId, msg.peerPublicKey);
+        members.clear();
+        const peers: PeerInfo[] =
+          msg.peers ??
+          (msg.peerId && msg.peerPublicKey
+            ? [{ id: msg.peerId, publicKey: msg.peerPublicKey }]
+            : []);
+        for (const p of peers) members.set(p.id, p.publicKey);
+        if (members.size === 0) {
+          setRoomKey(generateRoomKey());
+          ui.warn("waiting for peers — share the room code");
         } else {
-          ui.warn("waiting for peer — share the room code");
-          paintStatus();
+          ui.sys(`peers online: ${[...members.keys()].join(", ")}`);
+          ui.warn("waiting for room key…");
+          scheduleKeyRequests();
         }
-        setPrompt();
-        break;
-      case "peer_joined":
-        onChannelReady(msg.peerId, msg.peerPublicKey);
-        setPrompt();
-        break;
-      case "peer_left":
-        peerOnline = false;
-        peerId = null;
-        sharedKey = null;
-        safetyNumber = null;
-        ui.warn("peer left — waiting for rejoin…");
+        if (safetyNumber) process.stdout.write(ui.safetyCard(safetyNumber));
         paintStatus();
         setPrompt();
         break;
+      case "peer_joined":
+        members.set(msg.peerId, msg.peerPublicKey);
+        participantCount = msg.participantCount ?? members.size + 1;
+        ui.ok(ui.c.white("peer joined · ") + ui.c.cyan(msg.peerId));
+        if (roomKey) {
+          shareKeyWithRetry(msg.peerId, msg.peerPublicKey);
+        } else {
+          scheduleKeyRequests();
+        }
+        paintStatus();
+        setPrompt();
+        break;
+      case "peer_left":
+        members.delete(msg.peerId);
+        clearKeyShareRetries(msg.peerId);
+        participantCount = msg.participantCount ?? members.size + 1;
+        ui.warn(`peer left · ${msg.peerId}`);
+        paintStatus();
+        setPrompt();
+        break;
+      case "key_share":
+        if (msg.to !== myId || roomKey) break;
+        try {
+          const pk = members.get(msg.from);
+          if (!pk) break;
+          const key = unwrapRoomKeyFromPeer(
+            keyPair.privateKey,
+            publicKeyFromBase64(pk),
+            msg.ciphertext,
+            msg.nonce,
+            roomId
+          );
+          setRoomKey(key);
+          ui.ok("room key received · channel open");
+          if (safetyNumber) process.stdout.write(ui.safetyCard(safetyNumber));
+          // One-shot mesh; peers can key_request if still missing
+          for (const [id, publicKey] of members) {
+            if (id === msg.from) continue;
+            shareKeyWith(id, publicKey);
+          }
+        } catch {
+          ui.err("failed to unwrap room key");
+        }
+        paintStatus();
+        setPrompt();
+        break;
+      case "key_request": {
+        // Requester retries key_request — reply once to avoid share storms
+        if (!roomKey || !msg.from) break;
+        const pk = members.get(msg.from);
+        if (!pk) break;
+        shareKeyWith(msg.from, pk);
+        break;
+      }
       case "message":
-        if (!sharedKey) break;
+        if (!roomKey) break;
         try {
           const text = decryptFromWire(
-            sharedKey,
+            roomKey,
             msg.ciphertext,
             msg.nonce
           );
           ui.msgPeer(msg.from, text, msg.ttlMode);
           scheduleBurn(msg.messageId, msg.ttlMode, false);
         } catch {
-          ui.err("decrypt failed (key mismatch?)");
+          ui.err("decrypt failed");
         }
         setPrompt();
         break;
       case "typing":
-        if (msg.state) {
-          ui.typingLine(msg.from);
-        } else {
-          setPrompt();
-        }
+        if (msg.state) ui.typingLine(msg.from);
+        else setPrompt();
         break;
       case "burn":
         burn(msg.messageId);
@@ -238,6 +397,8 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
     if (cleaned) return;
     cleaned = true;
     burnTimers.forEach((t) => clearTimeout(t));
+    clearKeyShareRetries();
+    clearKeyRequestRetries();
     keyPair.privateKey.fill(0);
     try {
       ws.close();
@@ -309,19 +470,14 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
 
     if (input === "/who" || input === "/status") {
       paintStatus();
-      if (safetyNumber) {
-        process.stdout.write(ui.safetyCard(safetyNumber));
-      }
+      if (safetyNumber) process.stdout.write(ui.safetyCard(safetyNumber));
       setPrompt();
       return;
     }
 
     if (input === "/safety" || input === "/fp") {
-      if (safetyNumber) {
-        process.stdout.write(ui.safetyCard(safetyNumber));
-      } else {
-        ui.warn("no safety number yet — wait for peer");
-      }
+      if (safetyNumber) process.stdout.write(ui.safetyCard(safetyNumber));
+      else ui.warn("no safety number yet");
       setPrompt();
       return;
     }
@@ -334,34 +490,35 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
 
     if (input.startsWith("/ttl")) {
       const mode = input.slice(4).trim();
-      if (!mode) {
-        ui.sys(`current burn: ${ttlMode}`);
-      } else if (isValidTtlMode(mode)) {
+      if (!mode) ui.sys(`current burn: ${ttlMode}`);
+      else if (isValidTtlMode(mode)) {
         ttlMode = mode;
         ui.ok(`burn after → ${ui.c.yellow(ttlMode)}`);
         paintStatus();
-      } else {
-        ui.err("usage: /ttl on_read|10s|60s");
-      }
+      } else ui.err("usage: /ttl on_read|10s|60s");
       setPrompt();
       return;
     }
 
     if (input.startsWith("/")) {
-      ui.warn(`unknown command — try /help`);
+      ui.warn("unknown command — try /help");
       setPrompt();
       return;
     }
 
-    if (!peerOnline || !sharedKey) {
-      ui.warn("peer not connected — message not sent");
+    if (!canSend() || !roomKey) {
+      ui.warn(
+        members.size === 0
+          ? "waiting for peers — message not sent"
+          : "encryption not ready — message not sent"
+      );
       setPrompt();
       return;
     }
 
     try {
       const messageId = generateMessageId();
-      const wire = encryptToWire(sharedKey, input);
+      const wire = encryptToWire(roomKey, input);
       ws.send(
         JSON.stringify({
           v: PROTOCOL_VERSION,
@@ -399,6 +556,7 @@ async function main() {
   if (cmd === "create") {
     process.stdout.write(ui.banner());
     let ttl: TtlMode = "60s";
+    let max: number = LIMITS.defaultMaxParticipants;
     const ttlIdx = args.indexOf("--ttl");
     if (ttlIdx >= 0 && args[ttlIdx + 1]) {
       const t = args[ttlIdx + 1]!;
@@ -408,11 +566,19 @@ async function main() {
       }
       ttl = t;
     }
-    ui.sys("creating room…");
-    const { roomId } = await createRoom();
+    const maxIdx = args.indexOf("--max");
+    if (maxIdx >= 0 && args[maxIdx + 1]) {
+      max = clampMaxParticipants(args[maxIdx + 1]);
+    }
+    ui.sys(`creating room (max ${max})…`);
+    const { roomId, maxParticipants } = await createRoom(max);
     process.stdout.write(
-      ui.roomCreatedCard(roomId, `${WEB_ORIGIN}/r/${roomId}`)
+      ui.roomCreatedCard(
+        roomId,
+        `${WEB_ORIGIN}/r/${roomId}`
+      )
     );
+    ui.sys(`max members: ${maxParticipants}`);
     await runSession(roomId, ttl);
     return;
   }

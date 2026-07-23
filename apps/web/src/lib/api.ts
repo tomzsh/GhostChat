@@ -6,10 +6,15 @@ function apiUrl(path: string): string {
   return `${base}${path}`;
 }
 
-export async function createRoom(): Promise<CreateRoomResponse> {
+export async function createRoom(options?: {
+  maxParticipants?: number;
+}): Promise<CreateRoomResponse> {
   const res = await fetch(apiUrl("/api/rooms"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      maxParticipants: options?.maxParticipants,
+    }),
   });
   if (res.status === 429) {
     throw new Error("Too many rooms created — try again in a minute");

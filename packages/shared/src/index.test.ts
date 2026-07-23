@@ -7,6 +7,8 @@ import {
   normalizeRoomId,
   isValidTtlMode,
   parseTtlMs,
+  clampMaxParticipants,
+  LIMITS,
   SAFE_ALPHABET,
 } from "./index.ts";
 
@@ -51,5 +53,16 @@ describe("ttl modes", () => {
     assert.ok(isValidTtlMode("120s"));
     assert.equal(isValidTtlMode("0s"), false);
     assert.equal(isValidTtlMode("nope"), false);
+  });
+});
+
+describe("max participants", () => {
+  it("clamps into allowed range", () => {
+    assert.equal(clampMaxParticipants(2), 2);
+    assert.equal(clampMaxParticipants(8), 8);
+    assert.equal(clampMaxParticipants(1), LIMITS.minMaxParticipants);
+    assert.equal(clampMaxParticipants(999), LIMITS.maxParticipantsCap);
+    assert.equal(clampMaxParticipants("5"), 5);
+    assert.equal(clampMaxParticipants(undefined), LIMITS.defaultMaxParticipants);
   });
 });

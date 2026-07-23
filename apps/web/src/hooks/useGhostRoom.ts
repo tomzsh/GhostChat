@@ -4,7 +4,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   decryptFromWire,
   encryptToWire,
-  deriveSharedKey,
+  generateRoomKey,
+  wrapRoomKeyForPeer,
+  unwrapRoomKeyFromPeer,
   publicKeyToBase64,
   publicKeyFromBase64,
   safetyNumberFromKey,
@@ -14,10 +16,16 @@ import {
   PROTOCOL_VERSION,
   parseServerMessage,
   type ServerMessage,
+  type PeerInfo,
 } from "@ghostchat/protocol";
 import { generateMessageId, parseTtlMs, type TtlMode } from "@ghostchat/shared";
 import { getWsUrl } from "@/lib/config";
 import { clearRoomKeyPair, getOrCreateRoomKeyPair } from "@/lib/keys";
+import {
+  clearCachedRoomKey,
+  getCachedRoomKey,
+  setCachedRoomKey,
+} from "@/lib/roomKey";
 import {
   clearRoomSession,
   getOrCreateDisplayId,
@@ -33,6 +41,11 @@ export type ChatMessage = {
   ttlMode: TtlMode;
   receivedAt: number;
   burning?: boolean;
+};
+
+export type RoomMember = {
+  id: string;
+  publicKey: string;
 };
 
 export type RoomConnectionState =
@@ -52,12 +65,19 @@ const PING_MS = 25_000;
 const RECONNECT_BASE_MS = 800;
 const RECONNECT_MAX_MS = 8_000;
 const MAX_RECONNECT = 6;
+/** Delays (ms) to re-send key_share to a peer after join. */
+const KEY_SHARE_RETRY_MS = [0, 600, 1800, 4000] as const;
+/** Delays (ms) to broadcast key_request while waiting for room key. */
+const KEY_REQUEST_RETRY_MS = [400, 1200, 2800, 5500, 9000] as const;
 
 export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
   const [state, setState] = useState<RoomConnectionState>("connecting");
   const [myId, setMyId] = useState<string | null>(null);
-  const [peerId, setPeerId] = useState<string | null>(null);
-  const [peerTyping, setPeerTyping] = useState(false);
+  const [members, setMembers] = useState<RoomMember[]>([]);
+  const [maxParticipants, setMaxParticipants] = useState(2);
+  const [participantCount, setParticipantCount] = useState(0);
+  /** Peer ids currently typing (group-safe multi-typing). */
+  const [typingPeers, setTypingPeers] = useState<string[]>([]);
   const [meTyping, setMeTyping] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [ttlMode, setTtlMode] = useState<TtlMode>(defaultTtl);
@@ -66,7 +86,11 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
 
   const wsRef = useRef<WebSocket | null>(null);
   const keyPairRef = useRef<KeyPair | null>(null);
-  const sharedKeyRef = useRef<Uint8Array | null>(null);
+  /** Group room AEAD key (shared by all members). */
+  const roomKeyRef = useRef<Uint8Array | null>(null);
+  const membersRef = useRef<RoomMember[]>([]);
+  /** Immediate map of peerId → publicKey (avoids setState race on key_share). */
+  const peerPubMapRef = useRef<Map<string, string>>(new Map());
   const roomIdRef = useRef(roomId);
   const intentionalClose = useRef(false);
   const reconnectAttempt = useRef(0);
@@ -75,19 +99,133 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     new Map()
   );
   const typingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Timers for key_share retries per peer id. */
+  const keyShareTimers = useRef<Map<string, ReturnType<typeof setTimeout>[]>>(
+    new Map()
+  );
+  /** Timers for key_request while waiting for room key. */
+  const keyRequestTimers = useRef<ReturnType<typeof setTimeout>[]>([]);
   const ttlModeRef = useRef(ttlMode);
   const myIdRef = useRef(myId);
   const stateRef = useRef(state);
+  const lastTypingSent = useRef(false);
 
   roomIdRef.current = roomId;
   ttlModeRef.current = ttlMode;
   myIdRef.current = myId;
   stateRef.current = state;
+  membersRef.current = members;
 
   const clearBurnTimers = useCallback(() => {
     burnTimers.current.forEach((t) => clearTimeout(t));
     burnTimers.current.clear();
   }, []);
+
+  const clearKeyShareTimers = useCallback((peerId?: string) => {
+    if (peerId) {
+      const list = keyShareTimers.current.get(peerId);
+      if (list) {
+        list.forEach(clearTimeout);
+        keyShareTimers.current.delete(peerId);
+      }
+      return;
+    }
+    keyShareTimers.current.forEach((list) => list.forEach(clearTimeout));
+    keyShareTimers.current.clear();
+  }, []);
+
+  const clearKeyRequestTimers = useCallback(() => {
+    keyRequestTimers.current.forEach(clearTimeout);
+    keyRequestTimers.current = [];
+  }, []);
+
+  const setRoomKey = useCallback(
+    (key: Uint8Array | null, rid?: string) => {
+      const id = rid ?? roomIdRef.current;
+      roomKeyRef.current = key;
+      if (key) {
+        setCachedRoomKey(id, key);
+        setSafetyNumber(safetyNumberFromKey(key));
+        // Stop asking others for the key once we have it
+        clearKeyRequestTimers();
+      } else {
+        setSafetyNumber(null);
+      }
+    },
+    [clearKeyRequestTimers]
+  );
+
+  const shareKeyWithPeer = useCallback(
+    (peer: RoomMember) => {
+      const ws = wsRef.current;
+      const kp = keyPairRef.current;
+      const roomKey = roomKeyRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN || !kp || !roomKey) return;
+      try {
+        const wire = wrapRoomKeyForPeer(
+          kp.privateKey,
+          publicKeyFromBase64(peer.publicKey),
+          roomKey,
+          roomIdRef.current
+        );
+        ws.send(
+          JSON.stringify({
+            v: PROTOCOL_VERSION,
+            type: "key_share",
+            to: peer.id,
+            ciphertext: wire.ciphertext,
+            nonce: wire.nonce,
+          })
+        );
+      } catch {
+        /* ignore wrap errors */
+      }
+    },
+    []
+  );
+
+  /** Share room key immediately + retry a few times (peer may not be ready). */
+  const shareKeyWithPeerRetry = useCallback(
+    (peer: RoomMember) => {
+      clearKeyShareTimers(peer.id);
+      const timers: ReturnType<typeof setTimeout>[] = [];
+      for (const delay of KEY_SHARE_RETRY_MS) {
+        const t = setTimeout(() => {
+          if (!roomKeyRef.current) return;
+          // Peer may have left
+          if (!peerPubMapRef.current.has(peer.id)) return;
+          shareKeyWithPeer(peer);
+        }, delay);
+        timers.push(t);
+      }
+      keyShareTimers.current.set(peer.id, timers);
+    },
+    [clearKeyShareTimers, shareKeyWithPeer]
+  );
+
+  /** Ask members who already have the key to re-send key_share. */
+  const requestRoomKey = useCallback(() => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (roomKeyRef.current) return;
+    ws.send(
+      JSON.stringify({
+        v: PROTOCOL_VERSION,
+        type: "key_request",
+      })
+    );
+  }, []);
+
+  const scheduleKeyRequests = useCallback(() => {
+    clearKeyRequestTimers();
+    if (roomKeyRef.current) return;
+    for (const delay of KEY_REQUEST_RETRY_MS) {
+      const t = setTimeout(() => {
+        if (!roomKeyRef.current) requestRoomKey();
+      }, delay);
+      keyRequestTimers.current.push(t);
+    }
+  }, [clearKeyRequestTimers, requestRoomKey]);
 
   const burnMessage = useCallback((messageId: string, notifyPeer: boolean) => {
     setMessages((prev) => {
@@ -133,81 +271,139 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     [burnMessage]
   );
 
-  const establishShared = useCallback(
-    (peerPublicKeyB64: string, rid: string) => {
-      const kp = keyPairRef.current;
-      if (!kp) return false;
-      try {
-        const key = deriveSharedKey(
-          kp.privateKey,
-          publicKeyFromBase64(peerPublicKeyB64),
-          rid
-        );
-        sharedKeyRef.current = key;
-        setSafetyNumber(safetyNumberFromKey(key));
-        return true;
-      } catch {
-        setError("Key exchange failed");
-        setSafetyNumber(null);
-        return false;
-      }
-    },
-    []
-  );
-
   const onServerRef = useRef<(msg: ServerMessage) => void>(() => {});
   onServerRef.current = (msg: ServerMessage) => {
     const rid = roomIdRef.current;
+    const kp = keyPairRef.current;
+
     switch (msg.type) {
       case "joined": {
         setMyId(msg.yourId);
         setError(null);
-        // Persist server-echoed token (may match client-created one)
         if (msg.sessionToken) sessionSet(`session:${rid}`, msg.sessionToken);
         if (msg.yourId) sessionSet(`display:${rid}`, msg.yourId);
-        if (msg.peerId && msg.peerPublicKey) {
-          if (establishShared(msg.peerPublicKey, rid)) {
-            setPeerId(msg.peerId);
-            setState("ready");
-          } else {
-            setState("error");
-          }
-        } else {
-          setPeerId(null);
-          setSafetyNumber(null);
-          sharedKeyRef.current = null;
+        setMaxParticipants(msg.maxParticipants ?? 2);
+        setParticipantCount(msg.participantCount ?? 1);
+
+        const peers: RoomMember[] =
+          msg.peers?.map((p: PeerInfo) => ({
+            id: p.id,
+            publicKey: p.publicKey,
+          })) ??
+          (msg.peerId && msg.peerPublicKey
+            ? [{ id: msg.peerId, publicKey: msg.peerPublicKey }]
+            : []);
+
+        const map = new Map<string, string>();
+        for (const p of peers) map.set(p.id, p.publicKey);
+        peerPubMapRef.current = map;
+        setMembers(peers);
+
+        // Restore room key from tab cache (Strict Mode / soft remount)
+        const cached = getCachedRoomKey(rid);
+        if (cached) {
+          setRoomKey(cached, rid);
+          for (const p of peers) shareKeyWithPeerRetry(p);
+          setState(peers.length > 0 ? "ready" : "waiting_peer");
+        } else if (peers.length === 0) {
+          // First occupant — mint group room key
+          setRoomKey(generateRoomKey(), rid);
           setState("waiting_peer");
+        } else {
+          // Wait for key_share; also proactively request it (retry)
+          setState("waiting_peer");
+          setError(null);
+          scheduleKeyRequests();
         }
         break;
       }
       case "peer_joined": {
         if (!msg.peerPublicKey || !msg.peerId) break;
-        if (establishShared(msg.peerPublicKey, rid)) {
-          setPeerId(msg.peerId);
-          setError(null);
+        const peer: RoomMember = {
+          id: msg.peerId,
+          publicKey: msg.peerPublicKey,
+        };
+        peerPubMapRef.current.set(peer.id, peer.publicKey);
+        setMembers((prev) => {
+          if (prev.some((m) => m.id === peer.id)) return prev;
+          return [...prev, peer];
+        });
+        setParticipantCount(msg.participantCount ?? 0);
+        // Share our room key with the newcomer (if we have it) + retries
+        if (roomKeyRef.current) {
+          shareKeyWithPeerRetry(peer);
           setState("ready");
         } else {
-          setError("Key exchange failed when peer joined");
-          setState("error");
+          // Try cache again (remount race)
+          const cached = getCachedRoomKey(rid);
+          if (cached) {
+            setRoomKey(cached, rid);
+            shareKeyWithPeerRetry(peer);
+            setState("ready");
+          } else if (membersRef.current.length > 0 || peer) {
+            // Still waiting for key — ensure requests are scheduled
+            scheduleKeyRequests();
+          }
         }
+        setError(null);
         break;
       }
       case "peer_left": {
-        setPeerId(null);
-        sharedKeyRef.current = null;
-        setSafetyNumber(null);
-        setPeerTyping(false);
-        setState("peer_left");
+        const leftId = msg.peerId;
+        peerPubMapRef.current.delete(leftId);
+        clearKeyShareTimers(leftId);
+        setMembers((prev) => {
+          const next = prev.filter((m) => m.id !== leftId);
+          if (next.length === 0) setState("waiting_peer");
+          return next;
+        });
+        setParticipantCount(msg.participantCount ?? 0);
+        setTypingPeers((prev) => prev.filter((id) => id !== leftId));
+        // Keep room key for remaining members
+        break;
+      }
+      case "key_share": {
+        if (!kp || msg.to !== myIdRef.current) break;
+        if (roomKeyRef.current) break; // already have key
+        try {
+          const senderPk = peerPubMapRef.current.get(msg.from);
+          if (!senderPk) break;
+          const key = unwrapRoomKeyFromPeer(
+            kp.privateKey,
+            publicKeyFromBase64(senderPk),
+            msg.ciphertext,
+            msg.nonce,
+            rid
+          );
+          setRoomKey(key, rid);
+          setState("ready");
+          setError(null);
+          // One-shot mesh to other known peers (they can key_request if still missing)
+          for (const [id, publicKey] of peerPubMapRef.current) {
+            if (id === msg.from) continue;
+            shareKeyWithPeer({ id, publicKey });
+          }
+        } catch {
+          setError("Failed to unwrap room key");
+        }
+        break;
+      }
+      case "key_request": {
+        // Requester already schedules retries — reply once (avoid N×retry storms)
+        if (!roomKeyRef.current || !msg.from) break;
+        const pk = peerPubMapRef.current.get(msg.from);
+        if (!pk) break;
+        shareKeyWithPeer({ id: msg.from, publicKey: pk });
         break;
       }
       case "message": {
-        if (!sharedKeyRef.current) {
-          setError("Received message but no shared key — reconnecting…");
+        if (!roomKeyRef.current) {
+          setError("Received message but no room key yet");
           break;
         }
         try {
           const text = decryptFromWire(
-            sharedKeyRef.current,
+            roomKeyRef.current,
             msg.ciphertext,
             msg.nonce
           );
@@ -226,14 +422,21 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
             ];
           });
           scheduleTtl(msg.messageId, msg.ttlMode, false);
-          setPeerTyping(false);
+          // Only clear typing indicator for the sender
+          setTypingPeers((prev) => prev.filter((id) => id !== msg.from));
         } catch {
           setError("Failed to decrypt a message (key mismatch?)");
         }
         break;
       }
       case "typing":
-        setPeerTyping(msg.state);
+        setTypingPeers((prev) => {
+          if (msg.state) {
+            if (prev.includes(msg.from)) return prev;
+            return [...prev, msg.from];
+          }
+          return prev.filter((id) => id !== msg.from);
+        });
         break;
       case "burn":
         burnMessage(msg.messageId, false);
@@ -243,7 +446,7 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
           msg.code === "room_not_found"
             ? "Room not found or already destroyed"
             : msg.code === "room_full"
-              ? "Room is full"
+              ? msg.message ?? "Room is full"
               : msg.code === "rate_limited"
                 ? "Rate limited — slow down"
                 : (msg.message ?? msg.code);
@@ -259,6 +462,7 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
         setError(`Room closed: ${msg.reason}`);
         clearRoomSession(rid);
         clearRoomKeyPair(rid);
+        clearCachedRoomKey(rid);
         intentionalClose.current = true;
         break;
       }
@@ -272,14 +476,18 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     reconnectAttempt.current = 0;
     setState("connecting");
     setError(null);
-    setPeerId(null);
-    setPeerTyping(false);
+    setMembers([]);
+    peerPubMapRef.current = new Map();
+    setParticipantCount(0);
+    setTypingPeers([]);
     setMeTyping(false);
     setMessages([]);
     setSafetyNumber(null);
-    sharedKeyRef.current = null;
+    clearKeyShareTimers();
+    clearKeyRequestTimers();
+    // Keep tab cache; restore on re-join. Only clear ref for this mount.
+    roomKeyRef.current = getCachedRoomKey(roomId);
 
-    // Stable identity across Strict Mode remounts (must exist BEFORE first join)
     const kp = getOrCreateRoomKeyPair(roomId);
     keyPairRef.current = kp;
     const displayId = getOrCreateDisplayId(roomId);
@@ -291,8 +499,6 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
 
     const connect = () => {
       if (disposed) return;
-
-      // Always reuse same token — never join as a second session in one tab
       const token = getOrCreateSessionToken(roomId);
       const url = getWsUrl(roomId);
       setState((s) =>
@@ -331,7 +537,7 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
           const msg = parseServerMessage(JSON.parse(String(ev.data)));
           if (msg) onServerRef.current(msg);
         } catch {
-          /* ignore malformed */
+          /* ignore */
         }
       };
 
@@ -353,13 +559,11 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
           setState((s) => (s === "error" || s === "closed" ? s : "closed"));
           return;
         }
-
         if (reconnectAttempt.current >= MAX_RECONNECT) {
           setError("Disconnected — could not reconnect");
           setState("error");
           return;
         }
-
         const attempt = reconnectAttempt.current++;
         const delay = Math.min(
           RECONNECT_BASE_MS * 2 ** attempt,
@@ -380,42 +584,45 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
 
     return () => {
       disposed = true;
-      // Do not set intentionalClose here for Strict Mode — only stop this
-      // effect's timers/socket. Leave intentionalClose for leaveRoom/errors.
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       if (pingTimer) clearInterval(pingTimer);
       clearBurnTimers();
+      clearKeyShareTimers();
+      clearKeyRequestTimers();
       if (typingTimer.current) clearTimeout(typingTimer.current);
       try {
-        // Prefer close without marking session ended
         wsRef.current?.close(1000, "remount");
       } catch {
         /* ignore */
       }
-      if (wsRef.current) wsRef.current = null;
-      // Keep keyPair in module store; only clear shared key for this instance
-      sharedKeyRef.current = null;
+      wsRef.current = null;
+      // Do not clear room key cache here (Strict Mode remount needs it)
+      roomKeyRef.current = null;
     };
-  }, [roomId, clearBurnTimers]);
+  }, [
+    roomId,
+    clearBurnTimers,
+    clearKeyShareTimers,
+    clearKeyRequestTimers,
+  ]);
 
   const sendMessage = useCallback(
     (text: string) => {
       const trimmed = text.trim();
       if (!trimmed) return false;
       const ws = wsRef.current;
-      const key = sharedKeyRef.current;
+      const key = roomKeyRef.current;
 
       if (!ws || ws.readyState !== WebSocket.OPEN) {
         setError("Not connected — wait a moment or refresh");
         return false;
       }
       if (!key) {
-        setError(
-          stateRef.current === "waiting_peer" ||
-            stateRef.current === "peer_left"
-            ? "Waiting for peer before you can send"
-            : "Encryption not ready — wait for peer"
-        );
+        setError("Encryption not ready — waiting for room key");
+        return false;
+      }
+      if (membersRef.current.length === 0) {
+        setError("Waiting for at least one peer to join");
         return false;
       }
 
@@ -447,6 +654,7 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
         ]);
         scheduleTtl(messageId, mode, true);
         setMeTyping(false);
+        lastTypingSent.current = false;
         ws.send(
           JSON.stringify({ v: PROTOCOL_VERSION, type: "typing", state: false })
         );
@@ -460,24 +668,20 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     [scheduleTtl]
   );
 
-  const lastTypingSent = useRef(false);
-
   const notifyTyping = useCallback((isTyping: boolean) => {
-    const ws = wsRef.current;
-    const sendTyping = (state: boolean) => {
+    const sendTyping = (s: boolean) => {
       if (wsRef.current?.readyState !== WebSocket.OPEN) return;
-      if (state === lastTypingSent.current) return;
-      lastTypingSent.current = state;
+      if (s === lastTypingSent.current) return;
+      lastTypingSent.current = s;
       wsRef.current.send(
-        JSON.stringify({ v: PROTOCOL_VERSION, type: "typing", state })
+        JSON.stringify({ v: PROTOCOL_VERSION, type: "typing", state: s })
       );
     };
 
     if (isTyping) {
-      // Always re-show local ASCII after a pause
       setMeTyping(true);
       if (typingTimer.current) clearTimeout(typingTimer.current);
-      sendTyping(true); // peer notified only on false→true
+      sendTyping(true);
       typingTimer.current = setTimeout(() => {
         setMeTyping(false);
         sendTyping(false);
@@ -499,10 +703,13 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
       reconnectTimer.current = null;
     }
     clearBurnTimers();
+    clearKeyShareTimers();
+    clearKeyRequestTimers();
     if (typingTimer.current) clearTimeout(typingTimer.current);
     const rid = roomIdRef.current;
     clearRoomSession(rid);
     clearRoomKeyPair(rid);
+    clearCachedRoomKey(rid);
     try {
       wsRef.current?.close(1000, "leave");
     } catch {
@@ -510,20 +717,44 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     }
     wsRef.current = null;
     keyPairRef.current = null;
-    sharedKeyRef.current = null;
-    setPeerId(null);
-    setPeerTyping(false);
+    roomKeyRef.current = null;
+    setMembers([]);
+    setTypingPeers([]);
     setMeTyping(false);
     setMessages([]);
     setSafetyNumber(null);
     setError(null);
     setState("closed");
-  }, [clearBurnTimers]);
+  }, [clearBurnTimers, clearKeyShareTimers, clearKeyRequestTimers]);
+
+  // Have room key (safety number) + at least one other member
+  const canSendUi =
+    !!safetyNumber &&
+    members.length > 0 &&
+    state !== "error" &&
+    state !== "closed" &&
+    state !== "connecting";
+
+  const displayState: RoomConnectionState =
+    canSendUi && state === "waiting_peer" ? "ready" : state;
+
+  /** Primary peer for 1:1 UI (first typing peer, else sole member). */
+  const peerId =
+    typingPeers[0] ?? (members.length === 1 ? members[0]!.id : null);
+  const peerTyping = typingPeers.length > 0;
 
   return {
-    state,
+    state: displayState,
     myId,
     peerId,
+    members,
+    maxParticipants,
+    participantCount: Math.max(
+      participantCount,
+      members.length + (myId ? 1 : 0)
+    ),
+    /** Ids of peers currently typing (0..n). Prefer this over peerTyping for groups. */
+    typingPeers,
     peerTyping,
     meTyping,
     messages,
@@ -534,7 +765,6 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     sendMessage,
     notifyTyping,
     leaveRoom,
-    // ready implies shared key was established in join handlers
-    canSend: state === "ready",
+    canSend: canSendUi,
   };
 }

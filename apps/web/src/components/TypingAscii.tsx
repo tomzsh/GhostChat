@@ -12,6 +12,13 @@ function short(id?: string | null): string {
   return id.length > 8 ? id.slice(0, 8) : id;
 }
 
+function formatPeerList(ids: string[]): string {
+  if (ids.length === 0) return "peer";
+  if (ids.length === 1) return short(ids[0]);
+  if (ids.length === 2) return `${short(ids[0])} & ${short(ids[1])}`;
+  return `${ids.length} peers`;
+}
+
 /** Compact 3-line frames for mobile */
 function frameCompact(
   tick: number,
@@ -80,18 +87,32 @@ function frameFull(
 }
 
 /**
- * Animated terminal ASCII while typing — compact on small screens.
+ * Animated terminal ASCII while typing — supports multi-peer groups.
  */
 export function TypingAscii({
   meTyping,
+  typingPeers = [],
+  /** @deprecated use typingPeers */
   peerTyping,
+  /** @deprecated use typingPeers */
   peerId,
 }: {
   meTyping: boolean;
-  peerTyping: boolean;
+  /** Peer display ids currently typing */
+  typingPeers?: string[];
+  peerTyping?: boolean;
   peerId?: string | null;
 }) {
-  const active = meTyping || peerTyping;
+  const peers =
+    typingPeers.length > 0
+      ? typingPeers
+      : peerTyping && peerId
+        ? [peerId]
+        : peerTyping
+          ? ["peer"]
+          : [];
+  const hasPeers = peers.length > 0;
+  const active = meTyping || hasPeers;
   const [tick, setTick] = useState(0);
   const [visible, setVisible] = useState(false);
   const [compact, setCompact] = useState(true);
@@ -116,19 +137,31 @@ export function TypingAscii({
 
   if (!active && !visible) return null;
 
-  const both = meTyping && peerTyping;
-  const onlyMe = meTyping && !peerTyping;
+  const both = meTyping && hasPeers;
+  const onlyMe = meTyping && !hasPeers;
   const mode = both ? "both" : onlyMe ? "me" : "peer";
-  const peerLabel = short(peerId);
+  const peerLabel = formatPeerList(peers);
   const art = compact
     ? frameCompact(tick, mode, peerLabel)
     : frameFull(tick, mode, peerLabel);
 
   const label = both
-    ? "Both typing"
+    ? `You + ${peerLabel} typing`
     : onlyMe
       ? "You are typing"
-      : `${peerId ?? "Peer"} is typing`;
+      : peers.length > 1
+        ? `${peerLabel} are typing`
+        : `${peerLabel} is typing`;
+
+  const caption = both
+    ? peers.length > 1
+      ? "group chatter…"
+      : "both chatting…"
+    : onlyMe
+      ? "sending…"
+      : peers.length > 1
+        ? `${peers.length} typing…`
+        : "incoming…";
 
   return (
     <div
@@ -145,18 +178,17 @@ export function TypingAscii({
       <pre className="typing-ascii__art whitespace-pre font-mono text-[9px] leading-tight text-ghost-green sm:text-[11px]">
         {art}
       </pre>
-      <div className="mt-1 flex items-center gap-1.5 text-[10px] text-ghost-dim">
+      <div className="mt-1 flex min-w-0 items-center gap-1.5 text-[10px] text-ghost-dim">
         <span className="inline-flex gap-0.5" aria-hidden>
           <span className="typing-dot">●</span>
           <span className="typing-dot">●</span>
           <span className="typing-dot">●</span>
         </span>
-        <span className="typing-ascii__caption truncate">
-          {both
-            ? "both chatting…"
-            : onlyMe
-              ? "sending…"
-              : "incoming…"}
+        <span className="typing-ascii__caption min-w-0 truncate">
+          {caption}
+          {hasPeers && !onlyMe ? (
+            <span className="text-ghost-green/70"> · {peerLabel}</span>
+          ) : null}
         </span>
       </div>
     </div>

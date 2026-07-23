@@ -113,5 +113,46 @@ export function safetyNumberFromKey(sharedKey: Uint8Array): string {
   return parts.join(" ");
 }
 
+// --- Group room key (shared AEAD key for all members) ---
+
+/** Random 32-byte room key — created by the first member, shared via ECDH wrap. */
+export function generateRoomKey(): Uint8Array {
+  return crypto.getRandomValues(new Uint8Array(KEY_LENGTH));
+}
+
+/**
+ * Wrap the room key for a peer using pairwise ECDH + AEAD.
+ * Context differs from message keys so wraps cannot be confused with chat traffic.
+ */
+export function wrapRoomKeyForPeer(
+  myPrivateKey: Uint8Array,
+  peerPublicKey: Uint8Array,
+  roomKey: Uint8Array,
+  roomId: string
+): { ciphertext: string; nonce: string } {
+  const wrapKey = deriveSharedKey(
+    myPrivateKey,
+    peerPublicKey,
+    `${roomId}:keyshare`
+  );
+  return encryptToWire(wrapKey, toBase64(roomKey));
+}
+
+export function unwrapRoomKeyFromPeer(
+  myPrivateKey: Uint8Array,
+  peerPublicKey: Uint8Array,
+  ciphertextB64: string,
+  nonceB64: string,
+  roomId: string
+): Uint8Array {
+  const wrapKey = deriveSharedKey(
+    myPrivateKey,
+    peerPublicKey,
+    `${roomId}:keyshare`
+  );
+  const b64 = decryptFromWire(wrapKey, ciphertextB64, nonceB64);
+  return fromBase64(b64);
+}
+
 // re-export utils sometimes useful for tests
 export { bytesToHex, hexToBytes };

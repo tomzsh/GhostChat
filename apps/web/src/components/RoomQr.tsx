@@ -5,6 +5,7 @@ import QRCode from "qrcode";
 
 /**
  * Compact QR for room join URL — sized for mobile chat chrome.
+ * Absolute URL is set only after mount to avoid SSR hydration mismatch.
  */
 export function RoomQr({
   roomId,
@@ -16,17 +17,25 @@ export function RoomQr({
   /** Smaller footprint for narrow chat header area */
   compact?: boolean;
 }) {
+  // SSR + first client paint: same relative path (no window)
+  const path = `/r/${roomId}`;
+  const [joinUrl, setJoinUrl] = useState(path);
   const [dataUrl, setDataUrl] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
-  const joinUrl =
-    typeof window !== "undefined"
-      ? `${window.location.origin}/r/${roomId}`
-      : `/r/${roomId}`;
+  // Resolve absolute origin after hydration only
+  useEffect(() => {
+    setJoinUrl(`${window.location.origin}/r/${roomId}`);
+  }, [roomId]);
 
   useEffect(() => {
     let cancelled = false;
     setErr(null);
+    // Wait until we have an absolute URL so QR works off-device scans
+    if (!joinUrl.startsWith("http")) {
+      setDataUrl(null);
+      return;
+    }
     const size = compact ? 140 : 180;
     QRCode.toDataURL(joinUrl, {
       errorCorrectionLevel: "M",

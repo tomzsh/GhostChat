@@ -44,20 +44,35 @@ function ttlShort(mode: TtlMode): string {
   return TTL_OPTIONS.find((o) => o.value === mode)?.short ?? mode;
 }
 
+function shortId(id: string): string {
+  return id.length > 10 ? `${id.slice(0, 8)}…` : id;
+}
+
+function typingStatus(typingPeers: string[]): string | null {
+  if (typingPeers.length === 0) return null;
+  if (typingPeers.length === 1) return `${shortId(typingPeers[0]!)} typing…`;
+  if (typingPeers.length === 2)
+    return `${shortId(typingPeers[0]!)} & ${shortId(typingPeers[1]!)} typing…`;
+  return `${typingPeers.length} typing…`;
+}
+
 function statusLine(
   state: RoomConnectionState,
   peerId: string | null,
-  peerTyping: boolean
+  typingPeers: string[],
+  memberCount: number
 ): string {
   switch (state) {
     case "connecting":
       return "Connecting…";
     case "waiting_peer":
       return "Waiting for peer…";
-    case "ready":
-      return peerTyping
-        ? `${peerId} typing…`
-        : `Connected · ${peerId ?? "peer"}`;
+    case "ready": {
+      const typing = typingStatus(typingPeers);
+      if (typing) return typing;
+      if (memberCount <= 1) return `Connected · ${peerId ?? "peer"}`;
+      return `Connected · ${memberCount} peers`;
+    }
     case "peer_left":
       return "Peer left";
     case "closed":
@@ -103,7 +118,10 @@ export function RoomChat({ roomId }: { roomId: string }) {
     state,
     myId,
     peerId,
-    peerTyping,
+    members,
+    maxParticipants,
+    participantCount,
+    typingPeers,
     meTyping,
     messages,
     ttlMode,
@@ -140,7 +158,7 @@ export function RoomChat({ roomId }: { roomId: string }) {
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages.length, peerTyping, meTyping, showQr]);
+  }, [messages.length, typingPeers.length, meTyping, showQr]);
 
   // Keep --app-height in sync with visual viewport (mobile keyboard / browser chrome)
   useEffect(() => {
@@ -239,7 +257,7 @@ export function RoomChat({ roomId }: { roomId: string }) {
         <div className="flex items-center justify-between gap-2">
           <span className="truncate">{myId ? `you: ${myId}` : "…"} · e2ee</span>
           <span className="truncate text-ghost-dim">
-            {statusLine(state, peerId, peerTyping)}
+            {statusLine(state, peerId, typingPeers, members.length)}
           </span>
         </div>
       }
@@ -275,15 +293,17 @@ export function RoomChat({ roomId }: { roomId: string }) {
           </div>
 
           <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] sm:text-[11px]">
+            <span className="font-medium text-ghost-green/90">
+              {participantCount}/{maxParticipants}
+            </span>
             <span className="text-ghost-dim">
-              {statusLine(state, peerId, peerTyping)}
+              {statusLine(state, peerId, typingPeers, members.length)}
             </span>
             {state === "waiting_peer" && (
-              <span className="text-ghost-amber">Share code or QR</span>
-            )}
-            {state === "peer_left" && (
-              <span className="animate-pulse text-ghost-amber">
-                Waiting rejoin…
+              <span className="text-ghost-amber">
+                {members.length === 0
+                  ? "Share code or QR"
+                  : "Waiting for room key…"}
               </span>
             )}
             {feedback ? (
@@ -297,6 +317,39 @@ export function RoomChat({ roomId }: { roomId: string }) {
               </span>
             ) : null}
           </div>
+
+          {/* Member chips — typing indicator per peer */}
+          {(myId || members.length > 0) && (
+            <div className="mt-1.5 flex flex-wrap gap-1">
+              {myId ? (
+                <span
+                  className={`chip chip--active !min-h-7 text-[10px] ${
+                    meTyping ? "ring-1 ring-ghost-green/40" : ""
+                  }`}
+                >
+                  you · {myId}
+                  {meTyping ? " · …" : ""}
+                </span>
+              ) : null}
+              {members.map((m) => {
+                const isTyping = typingPeers.includes(m.id);
+                return (
+                  <span
+                    key={m.id}
+                    className={`chip !min-h-7 text-[10px] ${
+                      isTyping
+                        ? "border-ghost-green/50 text-ghost-green ring-1 ring-ghost-green/30"
+                        : ""
+                    }`}
+                    title={isTyping ? `${m.id} is typing` : m.id}
+                  >
+                    {m.id}
+                    {isTyping ? " · …" : ""}
+                  </span>
+                );
+              })}
+            </div>
+          )}
         </div>
 
         {/* QR — compact, only when open */}
@@ -331,8 +384,7 @@ export function RoomChat({ roomId }: { roomId: string }) {
 
         <TypingAscii
           meTyping={meTyping && canSend}
-          peerTyping={peerTyping && canSend}
-          peerId={peerId}
+          typingPeers={canSend ? typingPeers : []}
         />
 
         {error ? (

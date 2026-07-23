@@ -2,12 +2,14 @@ import {
   PROTOCOL_VERSION,
   parseClientMessage,
   type ServerMessage,
+  type PeerInfo,
 } from "@ghostchat/protocol";
 import {
   LIMITS,
   generateDisplayId,
   isValidTtlMode,
   randomChars,
+  clampMaxParticipants,
 } from "@ghostchat/shared";
 
 type Attachment = {
@@ -26,26 +28,25 @@ function isLiveAttachment(a: Attachment | null | undefined): a is Attachment {
   return !!a && !a.sessionToken.endsWith("__replaced");
 }
 
-/** X25519 public keys are 32 raw bytes (base64 ≈ 44 chars with padding). */
 function isValidPublicKeyB64(b64: string): boolean {
   if (!b64 || b64.length < 40 || b64.length > 64) return false;
   try {
-    const bin = atob(b64);
-    return bin.length === X25519_PUB_BYTES;
+    return atob(b64).length === X25519_PUB_BYTES;
   } catch {
     return false;
   }
 }
 
 /**
- * One Durable Object = one room. Relays ciphertext only; never stores messages.
- * Uses WebSocket Hibernation API so the DO can sleep between events.
+ * One Durable Object = one room (1:1 or group).
+ * Relays ciphertext + key_share only; never stores messages.
  */
 export class RoomDurableObject implements DurableObject {
   private state: DurableObjectState;
   private roomId = "";
   private createdAt = 0;
   private initialized = false;
+  private maxParticipants: number = LIMITS.defaultMaxParticipants;
 
   constructor(state: DurableObjectState) {
     this.state = state;
@@ -53,10 +54,14 @@ export class RoomDurableObject implements DurableObject {
       const meta = await this.state.storage.get<{
         roomId: string;
         createdAt: number;
+        maxParticipants?: number;
       }>("meta");
       if (meta) {
         this.roomId = meta.roomId;
         this.createdAt = meta.createdAt;
+        this.maxParticipants = clampMaxParticipants(
+          meta.maxParticipants ?? LIMITS.defaultMaxParticipants
+        );
         this.initialized = true;
       }
     });
@@ -66,34 +71,42 @@ export class RoomDurableObject implements DurableObject {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // Internal: ensure room exists (called from create)
     if (path === "/init" && request.method === "POST") {
-      const body = (await request.json()) as { roomId: string };
+      const body = (await request.json()) as {
+        roomId: string;
+        maxParticipants?: number;
+      };
       if (!this.initialized) {
         this.roomId = body.roomId;
         this.createdAt = Date.now();
+        this.maxParticipants = clampMaxParticipants(body.maxParticipants);
         this.initialized = true;
         await this.state.storage.put("meta", {
           roomId: this.roomId,
           createdAt: this.createdAt,
+          maxParticipants: this.maxParticipants,
         });
         await this.state.storage.setAlarm(Date.now() + LIMITS.maxAgeMs);
         await this.state.storage.put("alarmKind", ALARM_MAX_AGE);
       }
-      return Response.json({ ok: true, roomId: this.roomId });
+      return Response.json({
+        ok: true,
+        roomId: this.roomId,
+        maxParticipants: this.maxParticipants,
+      });
     }
 
     if (path === "/status" && request.method === "GET") {
       if (!this.initialized) {
         return Response.json({ status: "not_found" });
       }
-      // Unique sessions — not raw sockets (Strict Mode can open 2 sockets briefly)
       const count = this.uniqueSessions().size;
       return Response.json({
         status: "ok",
         roomId: this.roomId,
         participantCount: count,
-        full: count >= LIMITS.maxParticipants,
+        maxParticipants: this.maxParticipants,
+        full: count >= this.maxParticipants,
       });
     }
 
@@ -118,10 +131,7 @@ export class RoomDurableObject implements DurableObject {
 
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
-
-      // Hibernation: accept without tags first; attach after join
       this.state.acceptWebSocket(server);
-
       return new Response(null, { status: 101, webSocket: client });
     }
 
@@ -165,7 +175,12 @@ export class RoomDurableObject implements DurableObject {
 
     switch (msg.type) {
       case "join":
-        await this.handleJoin(ws, msg.displayId, msg.publicKey, msg.sessionToken);
+        await this.handleJoin(
+          ws,
+          msg.displayId,
+          msg.publicKey,
+          msg.sessionToken
+        );
         break;
       case "message":
         if (!attachment) return;
@@ -196,13 +211,35 @@ export class RoomDurableObject implements DurableObject {
           true
         );
         break;
+      case "key_share":
+        if (!attachment) return;
+        this.handleKeyShare(ws, attachment, msg);
+        break;
+      case "key_request":
+        if (!attachment) return;
+        // Fan-out to all other live members so anyone with the room key can reply
+        this.broadcast(
+          ws,
+          {
+            v: PROTOCOL_VERSION,
+            type: "key_request",
+            from: attachment.displayId,
+          },
+          true
+        );
+        break;
       case "ping":
         this.send(ws, { v: PROTOCOL_VERSION, type: "pong" });
         break;
     }
   }
 
-  async webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean) {
+  async webSocketClose(
+    ws: WebSocket,
+    _code: number,
+    _reason: string,
+    _wasClean: boolean
+  ) {
     await this.onSocketGone(ws);
   }
 
@@ -216,7 +253,8 @@ export class RoomDurableObject implements DurableObject {
   }
 
   async alarm() {
-    const kind = (await this.state.storage.get<string>("alarmKind")) ?? ALARM_IDLE;
+    const kind =
+      (await this.state.storage.get<string>("alarmKind")) ?? ALARM_IDLE;
 
     if (kind === ALARM_MAX_AGE || this.isPastMaxAge()) {
       await this.closeRoom("max_age");
@@ -230,7 +268,6 @@ export class RoomDurableObject implements DurableObject {
       return;
     }
 
-    // Idle timeout
     const last =
       (await this.state.storage.get<number>("lastActivityAt")) ?? this.createdAt;
     if (Date.now() - last >= LIMITS.idleTimeoutMs) {
@@ -264,7 +301,6 @@ export class RoomDurableObject implements DurableObject {
         ? sessionToken
         : randomChars(16);
 
-    // Reconnect: drop prior sockets for this session (avoid double-count / false peer_left)
     for (const s of this.state.getWebSockets()) {
       if (s === ws) continue;
       const a = this.getAttachment(s);
@@ -279,14 +315,14 @@ export class RoomDurableObject implements DurableObject {
       }
     }
 
-    // Capacity = unique live sessions (not raw socket count)
     const sessions = this.uniqueSessions(ws);
     const isReturning = sessions.has(token);
-    if (!isReturning && sessions.size >= LIMITS.maxParticipants) {
+    if (!isReturning && sessions.size >= this.maxParticipants) {
       this.send(ws, {
         v: PROTOCOL_VERSION,
         type: "error",
         code: "room_full",
+        message: `Room full (max ${this.maxParticipants})`,
       });
       ws.close(1008, "room_full");
       return;
@@ -306,39 +342,71 @@ export class RoomDurableObject implements DurableObject {
     };
     this.setAttachment(ws, att);
 
-    // Find peer (other session)
-    let peerId: string | null = null;
-    let peerPublicKey: string | null = null;
+    const peers: PeerInfo[] = [];
     for (const s of this.joinedPeers(ws)) {
       const a = this.getAttachment(s);
       if (!a || a.sessionToken === token) continue;
-      peerId = a.displayId;
-      peerPublicKey = a.publicKey;
-      break;
+      peers.push({ id: a.displayId, publicKey: a.publicKey });
     }
+
+    const participantCount = this.uniqueSessions().size;
+    const first = peers[0] ?? null;
 
     this.send(ws, {
       v: PROTOCOL_VERSION,
       type: "joined",
       yourId: id,
-      peerId,
-      peerPublicKey,
       sessionToken: token,
+      maxParticipants: this.maxParticipants,
+      participantCount,
+      peers,
+      peerId: first?.id ?? null,
+      peerPublicKey: first?.publicKey ?? null,
     });
 
-    // Notify every other live peer (updated public key on reconnect)
-    if (peerId) {
-      for (const peerWs of this.joinedPeers(ws)) {
-        this.send(peerWs, {
-          v: PROTOCOL_VERSION,
-          type: "peer_joined",
-          peerId: id,
-          peerPublicKey: publicKey,
-        });
-      }
+    for (const peerWs of this.joinedPeers(ws)) {
+      this.send(peerWs, {
+        v: PROTOCOL_VERSION,
+        type: "peer_joined",
+        peerId: id,
+        peerPublicKey: publicKey,
+        participantCount,
+      });
     }
 
     await this.touchActivity();
+  }
+
+  private handleKeyShare(
+    ws: WebSocket,
+    attachment: Attachment,
+    msg: { to: string; ciphertext: string; nonce: string }
+  ) {
+    if (msg.ciphertext.length > LIMITS.maxCiphertextBytes * 2) {
+      this.send(ws, {
+        v: PROTOCOL_VERSION,
+        type: "error",
+        code: "invalid_payload",
+        message: "Payload too large",
+      });
+      return;
+    }
+
+    // Deliver only to the intended peer (by displayId)
+    for (const s of this.joinedPeers(ws)) {
+      const a = this.getAttachment(s);
+      if (a && a.displayId === msg.to) {
+        this.send(s, {
+          v: PROTOCOL_VERSION,
+          type: "key_share",
+          from: attachment.displayId,
+          to: msg.to,
+          ciphertext: msg.ciphertext,
+          nonce: msg.nonce,
+        });
+        return;
+      }
+    }
   }
 
   private handleMessage(
@@ -351,7 +419,6 @@ export class RoomDurableObject implements DurableObject {
       messageId: string;
     }
   ) {
-    // Rate limit
     const now = Date.now();
     attachment.messageTimestamps = attachment.messageTimestamps.filter(
       (t) => now - t < 1000
@@ -367,7 +434,6 @@ export class RoomDurableObject implements DurableObject {
     attachment.messageTimestamps.push(now);
     this.setAttachment(ws, attachment);
 
-    // Size limit (base64 is larger than raw; approximate)
     if (msg.ciphertext.length > LIMITS.maxCiphertextBytes * 2) {
       this.send(ws, {
         v: PROTOCOL_VERSION,
@@ -388,11 +454,8 @@ export class RoomDurableObject implements DurableObject {
       return;
     }
 
-    // Only relay if peer is present (no server-side queue)
     const peers = this.joinedPeers(ws);
-    if (peers.length === 0) {
-      return;
-    }
+    if (peers.length === 0) return;
 
     for (const peer of peers) {
       this.send(peer, {
@@ -412,36 +475,43 @@ export class RoomDurableObject implements DurableObject {
   private async onSocketGone(ws: WebSocket) {
     const att = this.getAttachment(ws);
     if (!att) return;
-
-    // Replaced socket (reconnect) — do NOT send peer_left; that was clearing
-    // the new connection's shared key and blocking send.
     if (att.sessionToken.endsWith("__replaced")) return;
 
-    // Same session already present on another live socket?
     for (const s of this.state.getWebSockets()) {
       if (s === ws) continue;
       const a = this.getAttachment(s);
       if (a && a.sessionToken === att.sessionToken) return;
     }
 
-    this.broadcast(ws, { v: PROTOCOL_VERSION, type: "peer_left" }, true);
+    const leftId = att.displayId;
+    // Clear so uniqueSessions drops this socket even if still listed briefly
+    try {
+      att.sessionToken = `${att.sessionToken}__gone`;
+      this.setAttachment(ws, att);
+    } catch {
+      /* ignore */
+    }
 
-    const remaining = this.state
-      .getWebSockets()
-      .filter((s) => {
-        if (s === ws) return false;
-        const a = this.getAttachment(s);
-        return a !== null && !a.sessionToken.endsWith("__replaced");
-      });
+    const participantCount = this.uniqueSessions().size;
 
-    if (remaining.length === 0) {
+    this.broadcast(
+      ws,
+      {
+        v: PROTOCOL_VERSION,
+        type: "peer_left",
+        peerId: leftId,
+        participantCount,
+      },
+      true
+    );
+
+    if (participantCount === 0) {
       await this.state.storage.put("emptySince", Date.now());
       await this.state.storage.setAlarm(Date.now() + LIMITS.reconnectGraceMs);
       await this.state.storage.put("alarmKind", "empty");
     }
   }
 
-  /** Active session tokens excluding `except` socket. */
   private uniqueSessions(except?: WebSocket): Set<string> {
     const set = new Set<string>();
     for (const s of this.state.getWebSockets()) {
@@ -453,7 +523,6 @@ export class RoomDurableObject implements DurableObject {
     return set;
   }
 
-  /** Live peer sockets that are fully joined (have attachment). */
   private joinedPeers(except?: WebSocket): WebSocket[] {
     const out: WebSocket[] = [];
     for (const s of this.state.getWebSockets()) {
@@ -490,7 +559,6 @@ export class RoomDurableObject implements DurableObject {
   private async touchActivity() {
     const now = Date.now();
     await this.state.storage.put("lastActivityAt", now);
-    // Don't override max_age alarm if closer
     const maxAgeAt = this.createdAt + LIMITS.maxAgeMs;
     const idleAt = now + LIMITS.idleTimeoutMs;
     if (idleAt < maxAgeAt) {
@@ -507,7 +575,11 @@ export class RoomDurableObject implements DurableObject {
     }
   }
 
-  private broadcast(except: WebSocket, msg: ServerMessage, onlyJoined: boolean) {
+  private broadcast(
+    except: WebSocket,
+    msg: ServerMessage,
+    onlyJoined: boolean
+  ) {
     for (const s of this.state.getWebSockets()) {
       if (s === except) continue;
       if (onlyJoined && !isLiveAttachment(this.getAttachment(s))) continue;
@@ -516,7 +588,6 @@ export class RoomDurableObject implements DurableObject {
   }
 
   private getAttachment(ws: WebSocket): Attachment | null {
-    // Hibernation-safe: use serializeAttachment / deserializeAttachment
     try {
       const a = ws.deserializeAttachment() as Attachment | null;
       return a ?? null;

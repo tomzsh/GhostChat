@@ -40,17 +40,38 @@ export function normalizeRoomId(id: string): string {
 
 /** Runtime limits */
 export const LIMITS = {
-  maxParticipants: 2,
+  /** Hard ceiling for room size (creator cannot exceed this). */
+  maxParticipantsCap: 20,
+  /** Default room size when creator does not specify. */
+  defaultMaxParticipants: 2,
+  /** Minimum room size (always at least a pair possible). */
+  minMaxParticipants: 2,
+  /** @deprecated use maxParticipantsCap — kept for older imports */
+  maxParticipants: 20,
   maxMessagesPerSecond: 5,
   maxCiphertextBytes: 4 * 1024,
   idleTimeoutMs: 10 * 60 * 1000,
   maxAgeMs: 24 * 60 * 60 * 1000,
   reconnectGraceMs: 30 * 1000,
-  /** Worker edge rate limits (per client IP, sliding window) */
   maxCreatesPerMinute: 10,
   maxJoinProbesPerMinute: 30,
   rateLimitWindowMs: 60_000,
 } as const;
+
+/** Clamp creator-provided max participants into allowed range. */
+export function clampMaxParticipants(n: unknown): number {
+  const raw =
+    typeof n === "number"
+      ? n
+      : typeof n === "string"
+        ? parseInt(n, 10)
+        : LIMITS.defaultMaxParticipants;
+  if (!Number.isFinite(raw)) return LIMITS.defaultMaxParticipants;
+  const v = Math.floor(raw);
+  if (v < LIMITS.minMaxParticipants) return LIMITS.minMaxParticipants;
+  if (v > LIMITS.maxParticipantsCap) return LIMITS.maxParticipantsCap;
+  return v;
+}
 
 export type TtlMode = "on_read" | "10s" | "60s" | `${number}s`;
 
