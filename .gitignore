@@ -13,3 +13,4 @@ dist-test
 coverage
 *.tsbuildinfo
 .vercel
+.env*
