@@ -9,7 +9,7 @@
     "build": "pnpm build:web"
   },
   "engines": { "node": ">=20" },
-  "packageManager": "pnpm@9.15.0",
+  "packageManager": "pnpm@10.8.0",
   "dependencies": {
     "next": "15.5.20"
   },
