@@ -7,7 +7,7 @@ import {
   exportKeyPackage,
   addMember,
   acceptWelcome,
-  processCommit,
+  processCommitIfNeeded,
   removeMember,
   encryptApp,
   decryptApp,
@@ -440,20 +440,24 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
       }
       case "mls_commit": {
         void enqueueMls(async () => {
+          // Committer already applied when creating the commit
           if (msg.from === myIdRef.current) return;
           const session = mlsRef.current;
+          // No group yet → this is our Add commit; Welcome is the source of truth
           if (!session?.state) return;
-          try {
-            const next = await processCommit(session, msg.commit);
+          const { session: next, applied } = await processCommitIfNeeded(
+            session,
+            msg.commit
+          );
+          if (applied) {
             persistMls(next);
-            if (membersRef.current.length > 0) {
-              setState("ready");
-            }
-            setError(null);
-          } catch {
-            // Epoch desync — joiner can re-broadcast KP; members stay on last epoch
-            setError("MLS commit failed (epoch?)");
+            if (membersRef.current.length > 0) setState("ready");
+            // Clear prior stale-commit noise if any
+            setError((prev) =>
+              prev && /MLS commit failed/i.test(prev) ? null : prev
+            );
           }
+          // applied=false: stale after Welcome / duplicate — never surface as error
         }).then(() => {
           void tryAddPending();
         });

@@ -2,6 +2,12 @@
 
 All notable changes to GhostChat are documented in this file.
 
+## [2.0.2] — 2026-07-23
+
+### Fixed
+- Restore `processCommitIfNeeded` after deploy rebase lost it — join no longer shows
+  `MLS commit failed (epoch?)` when Welcome already advanced the epoch
+
 ## [2.0.1] — 2026-07-23
 
 ### Fixed

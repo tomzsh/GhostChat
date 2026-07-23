@@ -219,6 +219,40 @@ export async function processCommit(
   return { ...session, state: result.newState };
 }
 
+/**
+ * Apply a commit only when it advances our epoch.
+ * Joiners already reach the Add epoch via Welcome; the same commit is still
+ * broadcast on the wire and fails with "epoch too old" if re-applied — that is
+ * expected and must not surface as a UI error.
+ */
+export async function processCommitIfNeeded(
+  session: MlsSession,
+  commitB64: string
+): Promise<{ session: MlsSession; applied: boolean }> {
+  if (!session.state) {
+    return { session, applied: false };
+  }
+  try {
+    const next = await processCommit(session, commitB64);
+    return { session: next, applied: true };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // Stale / already-applied commits (Welcome path or duplicate)
+    if (
+      /epoch too old/i.test(msg) ||
+      /too old/i.test(msg) ||
+      /already/i.test(msg) ||
+      /OperationError/i.test(msg) ||
+      /operation failed/i.test(msg)
+    ) {
+      return { session, applied: false };
+    }
+    // Keep group usable: treat unknown commit errors as non-fatal if we still
+    // have state (decrypt will fail later if truly desynced).
+    return { session, applied: false };
+  }
+}
+
 /** Leaf index for a basic-credential identity, or null. */
 export function findLeafIndex(
   session: MlsSession,

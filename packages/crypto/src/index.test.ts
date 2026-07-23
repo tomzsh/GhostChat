@@ -25,6 +25,7 @@ import {
   addMember,
   acceptWelcome,
   processCommit,
+  processCommitIfNeeded,
   removeMember,
   encryptApp,
   decryptApp,
@@ -173,6 +174,9 @@ describe("MLS group (RFC 9420)", () => {
     alice = add.session;
     bob = await acceptWelcome(bob, add.welcomeB64);
     assert.equal(epochSafetyNumber(alice), epochSafetyNumber(bob));
+    // Wire still broadcasts Add commit; joiner must not throw / must not apply
+    const stale = await processCommitIfNeeded(bob, add.commitB64);
+    assert.equal(stale.applied, false);
     const enc = await encryptApp(bob, "from bob");
     bob = enc.session;
     const dec = await decryptApp(alice, enc.ciphertextB64);

@@ -11,7 +11,7 @@ import {
   exportKeyPackage,
   addMember,
   acceptWelcome,
-  processCommit,
+  processCommitIfNeeded,
   removeMember,
   encryptApp,
   decryptApp,
@@ -400,13 +400,21 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
         break;
       case "mls_commit":
         if (msg.from === myId) break;
+        // No state yet → wait for Welcome; do not error on the Add commit
         if (!mls?.state) break;
         try {
           await enqueueMls(async () => {
             if (!mls?.state) return;
-            mls = await processCommit(mls, msg.commit);
-            setSafety();
-            ui.sys("MLS epoch advanced");
+            const { session: next, applied } = await processCommitIfNeeded(
+              mls,
+              msg.commit
+            );
+            mls = next;
+            if (applied) {
+              setSafety();
+              ui.sys("MLS epoch advanced");
+            }
+            // stale after Welcome: silent
           });
           await tryAddPending();
         } catch {

@@ -165,6 +165,7 @@ export {
   addMember,
   acceptWelcome,
   processCommit,
+  processCommitIfNeeded,
   removeMember,
   encryptApp,
   decryptApp,
