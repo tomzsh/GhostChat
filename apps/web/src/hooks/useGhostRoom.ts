@@ -13,6 +13,7 @@ import {
   decryptApp,
   epochSafetyNumber,
   hasMlsGroup,
+  findLeafIndex,
   MLS_NONCE_MARKER,
   type MlsSession,
 } from "@ghostchat/crypto";
@@ -213,6 +214,11 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
         if (!session?.state) return;
         if (addingPeer.current.has(peerId)) continue;
         if (peerId === my) continue;
+        // Already in MLS tree (e.g. KP retry after successful Welcome)
+        if (findLeafIndex(session, peerId) !== null) {
+          pendingKp.current.delete(peerId);
+          continue;
+        }
         addingPeer.current.add(peerId);
         try {
           const result = await addMember(session, pkg);
@@ -232,9 +238,14 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
           setState("ready");
           setError(null);
         } catch (e) {
-          setError(
-            e instanceof Error ? e.message : "Failed to add peer to MLS group"
-          );
+          const msg =
+            e instanceof Error ? e.message : "Failed to add peer to MLS group";
+          // Duplicate add / already member — drop pending, don't scare the UI
+          if (/already|duplicate|exist/i.test(msg)) {
+            pendingKp.current.delete(peerId);
+          } else {
+            setError(msg);
+          }
         } finally {
           addingPeer.current.delete(peerId);
         }

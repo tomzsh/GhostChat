@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="./README.md">English</a> · <strong>Bahasa Indonesia</strong>
-  · <a href="https://github.com/tomzsh/ghostchat/releases/tag/v2.0.0">v2.0.0</a>
+  · <a href="https://github.com/tomzsh/ghostchat/releases/tag/v2.0.1">v2.0.1</a>
 </p>
 
 Chat 1:1 **anonim**, **ephemeral**, dan **terenkripsi end-to-end**.  

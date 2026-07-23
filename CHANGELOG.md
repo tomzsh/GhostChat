@@ -2,6 +2,14 @@
 
 All notable changes to GhostChat are documented in this file.
 
+## [2.0.1] — 2026-07-23
+
+### Fixed
+- Ignore stale MLS commits after Welcome (`epoch too old` false error in UI)
+- Committer election excludes pending joiners (join deadlock)
+- Sequential `addMember` uses latest epoch state; MLS ops on a serial queue
+- Skip re-adding peers already in the ratchet tree (KP retries)
+
 ## [2.0.0] — 2026-07-23
 
 ### Breaking
@@ -16,11 +24,6 @@ All notable changes to GhostChat are documented in this file.
 - Committer election (lexicographic display id) for Add/Remove
 - KeyPackage retry while waiting for Welcome
 - Unit test: 3-party join + message + remove
-
-### Fixed (post-release hardening)
-- Committer election excludes pending joiners (avoids deadlock when joiner id &lt; creator id)
-- Sequential `addMember` always uses latest MLS state
-- MLS ops serialized on a queue (web + CLI) to prevent epoch races
 
 ### Notes
 - Server still never sees plaintext or private keys

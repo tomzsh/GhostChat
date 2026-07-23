@@ -17,6 +17,7 @@ import {
   decryptApp,
   epochSafetyNumber,
   hasMlsGroup,
+  findLeafIndex,
   MLS_NONCE_MARKER,
   type MlsSession,
 } from "@ghostchat/crypto";
@@ -213,6 +214,10 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
       for (const [peerId, pkg] of [...pendingKp.entries()]) {
         if (!mls?.state) return;
         if (adding.has(peerId) || peerId === myId) continue;
+        if (findLeafIndex(mls, peerId) !== null) {
+          pendingKp.delete(peerId);
+          continue;
+        }
         adding.add(peerId);
         try {
           const result = await addMember(mls, pkg);
@@ -233,7 +238,12 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
           ui.ok(`MLS added · ${peerId}`);
           if (safetyNumber) process.stdout.write(ui.safetyCard(safetyNumber));
         } catch (e) {
-          ui.err(e instanceof Error ? e.message : "add member failed");
+          const msg = e instanceof Error ? e.message : "add member failed";
+          if (/already|duplicate|exist/i.test(msg)) {
+            pendingKp.delete(peerId);
+          } else {
+            ui.err(msg);
+          }
         } finally {
           adding.delete(peerId);
         }
