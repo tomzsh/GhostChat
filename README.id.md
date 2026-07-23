@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="./README.md">English</a> · <strong>Bahasa Indonesia</strong>
-  · <a href="https://github.com/tomzsh/ghostchat/releases/tag/v1.1.0">v1.1.0</a>
+  · <a href="https://github.com/tomzsh/ghostchat/releases/tag/v2.0.0">v2.0.0</a>
 </p>
 
 Chat 1:1 **anonim**, **ephemeral**, dan **terenkripsi end-to-end**.  
@@ -50,7 +50,7 @@ GhostChat menyelesaikan masalah spesifik: **ngobrol dengan satu orang lain, seka
 |---|---|
 | Identitas | `Anon-XXXX` acak per sesi — tanpa registrasi |
 | Penyimpanan | Tidak ada riwayat pesan di server |
-| Enkripsi | X25519 + HKDF-SHA256 + XChaCha20-Poly1305 di client |
+| Enkripsi | **MLS (RFC 9420)** di client (`ts-mls`); server hanya relay ciphertext |
 | Akses room | Kode 6 karakter (atau link / QR) |
 | Siklus hidup | Musnah saat kosong, idle 10 menit, atau usia maks 24 jam |
 
@@ -117,7 +117,7 @@ ghostchat/
 │   ├── worker/              # Cloudflare Worker + Room Durable Object
 │   └── cli/                 # ghost create | ghost join
 ├── packages/
-│   ├── crypto/              # X25519, HKDF, XChaCha20-Poly1305, safety number
+│   ├── crypto/              # MLS (ts-mls) + helper pairwise legacy
 │   ├── protocol/            # Tipe & parser pesan WebSocket
 │   └── shared/              # Kode room, limit, helper TTL
 ├── package.json             # Root workspace pnpm
@@ -299,16 +299,17 @@ Tipe TypeScript bersama ada di `packages/protocol`.
 
 | Langkah | Algoritma | Library |
 |---|---|---|
-| Key agreement | X25519 ECDH | `@noble/curves` |
-| KDF | HKDF-SHA256 (`info = ghostchat:<roomId>`) | `@noble/hashes` |
-| AEAD | XChaCha20-Poly1305 (nonce 24 byte) | `@noble/ciphers` |
-| Safety number | SHA-256 shared key → `XXXXX XXXXX XXXXX` | `@noble/hashes` |
+| Group E2EE | **MLS (RFC 9420)** | `ts-mls` |
+| Ciphersuite | MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 | `ts-mls` / `@hpke/core` |
+| Safety number | SHA-256 MLS `confirmedTranscriptHash` → `XXXXX XXXXX XXXXX` | `@noble/hashes` |
+| Protocol | `PROTOCOL_VERSION = 2` | `@ghostchat/protocol` |
 
 **Aturan:**
 
-- Kunci privat hanya di memori proses / tab
-- Server hanya melihat public key + ciphertext + metadata kehadiran
-- Safety number harus sama di kedua perangkat; jika beda, anggap channel terkompromi
+- Kunci privat & state MLS hanya di memori proses / tab
+- Server hanya melihat frame ciphertext MLS + metadata kehadiran
+- Safety number terikat epoch — bandingkan ulang setelah join; jika beda, anggap channel terkompromi
+- `ts-mls` belum diaudit formal
 
 ### Apa itu “Burn after” (TTL)?
 
@@ -457,7 +458,7 @@ Kemungkinan lanjutan (tidak wajib untuk MVP):
 - Grace reconnect lebih lama di server  
 - Passphrase room opsional  
 - Scanner QR in-app  
-- Group chat (perlu MLS dsb. — bukan sekadar tambah slot)
+- Post-quantum MLS ciphersuites (X-Wing / ML-KEM)
 
 Di luar cakupan by design: akun, riwayat cloud, push notification, moderasi konten plaintext di server.
 

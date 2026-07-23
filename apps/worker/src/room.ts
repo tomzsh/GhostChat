@@ -22,24 +22,23 @@ type Attachment = {
 
 const ALARM_IDLE = "idle";
 const ALARM_MAX_AGE = "max_age";
-const X25519_PUB_BYTES = 32;
-
 function isLiveAttachment(a: Attachment | null | undefined): a is Attachment {
   return !!a && !a.sessionToken.endsWith("__replaced");
 }
 
-function isValidPublicKeyB64(b64: string): boolean {
-  if (!b64 || b64.length < 40 || b64.length > 64) return false;
-  try {
-    return atob(b64).length === X25519_PUB_BYTES;
-  } catch {
-    return false;
-  }
+/** Join publicKey is presence-only under MLS (v2); accept short markers. */
+function isValidJoinPublicKey(pk: string): boolean {
+  if (!pk || pk.length > 128) return false;
+  return true;
+}
+
+function isValidMlsPayload(s: string): boolean {
+  return typeof s === "string" && s.length > 0 && s.length <= LIMITS.maxMlsPayloadBytes;
 }
 
 /**
  * One Durable Object = one room (1:1 or group).
- * Relays ciphertext + key_share only; never stores messages.
+ * Relays ciphertext + MLS control frames only; never stores messages or keys.
  */
 export class RoomDurableObject implements DurableObject {
   private state: DurableObjectState;
@@ -211,22 +210,17 @@ export class RoomDurableObject implements DurableObject {
           true
         );
         break;
-      case "key_share":
+      case "mls_key_package":
         if (!attachment) return;
-        this.handleKeyShare(ws, attachment, msg);
+        this.handleMlsKeyPackage(ws, attachment, msg.package);
         break;
-      case "key_request":
+      case "mls_welcome":
         if (!attachment) return;
-        // Fan-out to all other live members so anyone with the room key can reply
-        this.broadcast(
-          ws,
-          {
-            v: PROTOCOL_VERSION,
-            type: "key_request",
-            from: attachment.displayId,
-          },
-          true
-        );
+        this.handleMlsWelcome(ws, attachment, msg.to, msg.welcome);
+        break;
+      case "mls_commit":
+        if (!attachment) return;
+        this.handleMlsCommit(ws, attachment, msg.commit);
         break;
       case "ping":
         this.send(ws, { v: PROTOCOL_VERSION, type: "pong" });
@@ -285,12 +279,12 @@ export class RoomDurableObject implements DurableObject {
     publicKey: string,
     sessionToken?: string
   ) {
-    if (!isValidPublicKeyB64(publicKey)) {
+    if (!isValidJoinPublicKey(publicKey)) {
       this.send(ws, {
         v: PROTOCOL_VERSION,
         type: "error",
         code: "invalid_payload",
-        message: "Invalid public key",
+        message: "Invalid join payload",
       });
       ws.close(1008, "invalid_payload");
       return;
@@ -377,36 +371,89 @@ export class RoomDurableObject implements DurableObject {
     await this.touchActivity();
   }
 
-  private handleKeyShare(
+  private handleMlsKeyPackage(
     ws: WebSocket,
     attachment: Attachment,
-    msg: { to: string; ciphertext: string; nonce: string }
+    pkg: string
   ) {
-    if (msg.ciphertext.length > LIMITS.maxCiphertextBytes * 2) {
+    if (!isValidMlsPayload(pkg)) {
       this.send(ws, {
         v: PROTOCOL_VERSION,
         type: "error",
         code: "invalid_payload",
-        message: "Payload too large",
+        message: "MLS key package too large",
       });
       return;
     }
+    this.broadcast(
+      ws,
+      {
+        v: PROTOCOL_VERSION,
+        type: "mls_key_package",
+        from: attachment.displayId,
+        package: pkg,
+      },
+      true
+    );
+    void this.touchActivity();
+  }
 
-    // Deliver only to the intended peer (by displayId)
+  private handleMlsWelcome(
+    ws: WebSocket,
+    attachment: Attachment,
+    to: string,
+    welcome: string
+  ) {
+    if (!isValidMlsPayload(welcome) || !to) {
+      this.send(ws, {
+        v: PROTOCOL_VERSION,
+        type: "error",
+        code: "invalid_payload",
+        message: "Invalid MLS welcome",
+      });
+      return;
+    }
     for (const s of this.joinedPeers(ws)) {
       const a = this.getAttachment(s);
-      if (a && a.displayId === msg.to) {
+      if (a && a.displayId === to) {
         this.send(s, {
           v: PROTOCOL_VERSION,
-          type: "key_share",
+          type: "mls_welcome",
           from: attachment.displayId,
-          to: msg.to,
-          ciphertext: msg.ciphertext,
-          nonce: msg.nonce,
+          to,
+          welcome,
         });
+        void this.touchActivity();
         return;
       }
     }
+  }
+
+  private handleMlsCommit(
+    ws: WebSocket,
+    attachment: Attachment,
+    commit: string
+  ) {
+    if (!isValidMlsPayload(commit)) {
+      this.send(ws, {
+        v: PROTOCOL_VERSION,
+        type: "error",
+        code: "invalid_payload",
+        message: "MLS commit too large",
+      });
+      return;
+    }
+    this.broadcast(
+      ws,
+      {
+        v: PROTOCOL_VERSION,
+        type: "mls_commit",
+        from: attachment.displayId,
+        commit,
+      },
+      true
+    );
+    void this.touchActivity();
   }
 
   private handleMessage(

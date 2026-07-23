@@ -6,9 +6,9 @@ This file is the **primary entrypoint** for automated coding agents (Cursor, Cla
 
 ## Project in one paragraph
 
-**GhostChat** is a monorepo for **anonymous, ephemeral end-to-end encrypted chat** (1:1 and small groups). Clients: Next.js web + Node CLI. Backend: Cloudflare Worker + Durable Objects (ciphertext relay only — no message storage). Privacy principles override feature creep.
+**GhostChat** is a monorepo for **anonymous, ephemeral end-to-end encrypted chat** (1:1 and small groups via **MLS**). Clients: Next.js web + Node CLI. Backend: Cloudflare Worker + Durable Objects (ciphertext relay only — no message storage). Privacy principles override feature creep.
 
-**Version:** 1.1.0 · **Package manager:** pnpm 9 · **Node:** ≥ 20
+**Version:** 2.0.0 · **Package manager:** pnpm 9 · **Node:** ≥ 20
 
 ---
 
@@ -17,7 +17,7 @@ This file is the **primary entrypoint** for automated coding agents (Cursor, Cla
 1. **Never store message plaintext or private keys on the server.** Worker only relays ciphertext + presence metadata.
 2. **Never write chat history to Durable Object storage, D1, KV, or logs.** Storage may hold short-lived room meta/alarms only.
 3. **Do not add accounts, persistent identity, or multi-device sync** without an explicit product decision (conflicts with ephemeral design).
-4. **Group chat uses a shared room AEAD key** wrapped to each peer via pairwise ECDH (`key_share`). Not full MLS — do not claim post-compromise security for large groups. Creator sets `maxParticipants` (2–20).
+4. **Group E2EE uses MLS (RFC 9420)** via `ts-mls` (`packages/crypto` `mls.ts`). Server relays `mls_key_package` / `mls_welcome` / `mls_commit` + app ciphertext only — never group state or private keys. Creator sets `maxParticipants` (2–20). Ciphersuite: `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`.
 5. **Do not commit secrets:** `.env`, `.env.local`, `.dev.vars`, API keys, Cloudflare tokens.
 6. **Do not expand scope** into file sharing / push / moderation of ciphertext unless asked.
 7. Prefer **editing existing files** over new dependencies. Justify any new package.
@@ -46,7 +46,7 @@ ghostchat/
 |---|---|---|
 | `packages/shared` | `@ghostchat/shared` | `generateRoomId`, `LIMITS`, `TtlMode`, alphabet |
 | `packages/protocol` | `@ghostchat/protocol` | WS JSON schema, `parseClientMessage` |
-| `packages/crypto` | `@ghostchat/crypto` | Key exchange, AEAD, `safetyNumberFromKey` |
+| `packages/crypto` | `@ghostchat/crypto` | MLS group E2EE (`mls.ts`), safety number |
 | `apps/worker` | — | HTTP + WS routing, DO room lifecycle |
 | `apps/web` | — | UI, `useGhostRoom`, session keys |
 | `apps/cli` | — | Terminal client + ANSI UI |
@@ -61,7 +61,8 @@ Always build packages after changing them: `pnpm build:packages`.
 | Path | When to edit |
 |---|---|
 | `packages/protocol/src/index.ts` | Add/change WS message types |
-| `packages/crypto/src/index.ts` | Encryption / safety number |
+| `packages/crypto/src/mls.ts` | MLS session: group, welcome, commit, app encrypt |
+| `packages/crypto/src/index.ts` | Crypto exports + legacy pairwise helpers |
 | `packages/shared/src/index.ts` | Limits, room ID rules, TTL |
 | `apps/worker/src/index.ts` | REST routes, rate limits, CORS |
 | `apps/worker/src/room.ts` | Room DO: join, relay, peer_left, alarms |
@@ -128,9 +129,9 @@ pnpm --filter @ghostchat/cli start join <ROOM_ID>
 - Always send `sessionToken` on first join (pre-create client-side) to avoid double-session / room_full.
 
 ### Crypto
-- ECDH X25519 → HKDF-SHA256 with `info = ghostchat:<roomId>` → XChaCha20-Poly1305.
-- Safety number = formatted SHA-256 of shared key; both peers must match.
-- Nonce 24 bytes per message; never reuse.
+- **MLS (primary):** KeyPackage → createGroup / Welcome+Commit → `createApplicationMessage` / `processPrivateMessage`.
+- Safety number = formatted SHA-256 of MLS `confirmedTranscriptHash` (epoch-bound).
+- Legacy pairwise X25519 + XChaCha20 helpers remain in crypto package for tests; wire path is MLS only (`PROTOCOL_VERSION = 2`).
 
 ### Networking
 - REST (browser): prefer same-origin `/api/*` (Next rewrites → worker).
@@ -206,7 +207,7 @@ Add unit tests next to packages when changing crypto or limits.
 ## Out of scope unless explicitly requested
 
 - User accounts, OAuth, email
-- Group chat / MLS
+- PQ MLS ciphersuites (X-Wing / ML-KEM) — classical suite only for MVP
 - File/media storage
 - Push notifications
 - Server-side message search or moderation of plaintext

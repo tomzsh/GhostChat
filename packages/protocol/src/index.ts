@@ -1,6 +1,7 @@
 import type { TtlMode } from "@ghostchat/shared";
 
-export const PROTOCOL_VERSION = 1 as const;
+/** Wire protocol major version — v2 = MLS group E2EE. */
+export const PROTOCOL_VERSION = 2 as const;
 
 export type ErrorCode =
   | "room_full"
@@ -15,9 +16,10 @@ export type RoomClosedReason =
   | "max_age"
   | "empty";
 
-/** Peer identity + public key as seen on the wire */
+/** Peer identity as seen on the wire (MLS uses separate key packages). */
 export type PeerInfo = {
   id: string;
+  /** Legacy / optional; may be empty or "mls" under protocol v2. */
   publicKey: string;
 };
 
@@ -27,13 +29,16 @@ export type ClientMessage =
       v: typeof PROTOCOL_VERSION;
       type: "join";
       displayId: string;
+      /** Optional under v2; keep for DO presence validation. */
       publicKey: string;
       sessionToken?: string;
     }
   | {
       v: typeof PROTOCOL_VERSION;
       type: "message";
+      /** Base64 MLS PrivateMessage (application). */
       ciphertext: string;
+      /** Marker `"mls"` for MLS app messages. */
       nonce: string;
       ttlMode: TtlMode;
       messageId: string;
@@ -48,18 +53,24 @@ export type ClientMessage =
       type: "burn";
       messageId: string;
     }
-  /** Wrap room AEAD key for a specific peer (ECDH-encrypted). */
+  /** MLS KeyPackage for joiners (broadcast). */
   | {
       v: typeof PROTOCOL_VERSION;
-      type: "key_share";
-      to: string;
-      ciphertext: string;
-      nonce: string;
+      type: "mls_key_package";
+      package: string;
     }
-  /** Ask existing members to (re)send key_share to me. */
+  /** MLS Welcome targeted at a joiner. */
   | {
       v: typeof PROTOCOL_VERSION;
-      type: "key_request";
+      type: "mls_welcome";
+      to: string;
+      welcome: string;
+    }
+  /** MLS Commit (Add/Remove/…) for all members. */
+  | {
+      v: typeof PROTOCOL_VERSION;
+      type: "mls_commit";
+      commit: string;
     }
   | {
       v: typeof PROTOCOL_VERSION;
@@ -75,7 +86,6 @@ export type ServerMessage =
       sessionToken: string;
       maxParticipants: number;
       participantCount: number;
-      /** All other members already in the room */
       peers: PeerInfo[];
       /** @deprecated first peer only — use peers[] */
       peerId: string | null;
@@ -116,16 +126,22 @@ export type ServerMessage =
     }
   | {
       v: typeof PROTOCOL_VERSION;
-      type: "key_share";
+      type: "mls_key_package";
       from: string;
-      to: string;
-      ciphertext: string;
-      nonce: string;
+      package: string;
     }
   | {
       v: typeof PROTOCOL_VERSION;
-      type: "key_request";
+      type: "mls_welcome";
       from: string;
+      to: string;
+      welcome: string;
+    }
+  | {
+      v: typeof PROTOCOL_VERSION;
+      type: "mls_commit";
+      from: string;
+      commit: string;
     }
   | {
       v: typeof PROTOCOL_VERSION;
@@ -164,6 +180,10 @@ export type CreateRoomResponse = {
   maxParticipants: number;
 };
 
+function isNonEmptyString(v: unknown, max: number): v is string {
+  return typeof v === "string" && v.length > 0 && v.length <= max;
+}
+
 export function parseClientMessage(raw: unknown): ClientMessage | null {
   if (!raw || typeof raw !== "object") return null;
   const msg = raw as Record<string, unknown>;
@@ -171,19 +191,18 @@ export function parseClientMessage(raw: unknown): ClientMessage | null {
 
   switch (msg.type) {
     case "join":
-      if (typeof msg.displayId !== "string" || typeof msg.publicKey !== "string")
-        return null;
+      if (typeof msg.displayId !== "string") return null;
       return {
         v: PROTOCOL_VERSION,
         type: "join",
         displayId: msg.displayId,
-        publicKey: msg.publicKey,
+        publicKey: typeof msg.publicKey === "string" ? msg.publicKey : "mls",
         sessionToken:
           typeof msg.sessionToken === "string" ? msg.sessionToken : undefined,
       };
     case "message":
       if (
-        typeof msg.ciphertext !== "string" ||
+        !isNonEmptyString(msg.ciphertext, 96_000) ||
         typeof msg.nonce !== "string" ||
         typeof msg.ttlMode !== "string" ||
         typeof msg.messageId !== "string"
@@ -207,22 +226,32 @@ export function parseClientMessage(raw: unknown): ClientMessage | null {
         type: "burn",
         messageId: msg.messageId,
       };
-    case "key_share":
+    case "mls_key_package":
+      if (!isNonEmptyString(msg.package, 96_000)) return null;
+      return {
+        v: PROTOCOL_VERSION,
+        type: "mls_key_package",
+        package: msg.package,
+      };
+    case "mls_welcome":
       if (
         typeof msg.to !== "string" ||
-        typeof msg.ciphertext !== "string" ||
-        typeof msg.nonce !== "string"
+        !isNonEmptyString(msg.welcome, 96_000)
       )
         return null;
       return {
         v: PROTOCOL_VERSION,
-        type: "key_share",
+        type: "mls_welcome",
         to: msg.to,
-        ciphertext: msg.ciphertext,
-        nonce: msg.nonce,
+        welcome: msg.welcome,
       };
-    case "key_request":
-      return { v: PROTOCOL_VERSION, type: "key_request" };
+    case "mls_commit":
+      if (!isNonEmptyString(msg.commit, 96_000)) return null;
+      return {
+        v: PROTOCOL_VERSION,
+        type: "mls_commit",
+        commit: msg.commit,
+      };
     case "ping":
       return { v: PROTOCOL_VERSION, type: "ping" };
     default:

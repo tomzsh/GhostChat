@@ -190,9 +190,10 @@ export function RoomChat({ roomId }: { roomId: string }) {
   }, []);
 
   const onSubmit = useCallback(
-    (e: React.FormEvent) => {
+    async (e: React.FormEvent) => {
       e.preventDefault();
-      if (sendMessage(draft)) {
+      const ok = await sendMessage(draft);
+      if (ok) {
         setDraft("");
         notifyTyping(false);
         // Keep focus for rapid mobile typing
@@ -303,7 +304,7 @@ export function RoomChat({ roomId }: { roomId: string }) {
               <span className="text-ghost-amber">
                 {members.length === 0
                   ? "Share code or QR"
-                  : "Waiting for room key…"}
+                  : "Waiting for MLS welcome…"}
               </span>
             )}
             {feedback ? (

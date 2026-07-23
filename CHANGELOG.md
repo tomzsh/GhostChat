@@ -2,6 +2,26 @@
 
 All notable changes to GhostChat are documented in this file.
 
+## [2.0.0] — 2026-07-23
+
+### Breaking
+- **MLS (RFC 9420)** replaces shared room AEAD key + ECDH `key_share`
+- Wire protocol **`v: 2`** — frames: `mls_key_package`, `mls_welcome`, `mls_commit`
+- Application messages are MLS PrivateMessages (`nonce: "mls"`)
+- Safety number is epoch-bound (`confirmedTranscriptHash`)
+
+### Added
+- `packages/crypto` MLS API (`createMlsSession`, `addMember`, `acceptWelcome`, …) via **ts-mls**
+- Ciphersuite: `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`
+- Committer election (lexicographic display id) for Add/Remove
+- KeyPackage retry while waiting for Welcome
+- Unit test: 3-party join + message + remove
+
+### Notes
+- Server still never sees plaintext or private keys
+- `ts-mls` is not formally audited — use at your own risk for high-threat scenarios
+- v1.1 clients cannot join v2 rooms (ephemeral — no migration)
+
 ## [1.1.0] — 2026-07-23
 
 ### Added

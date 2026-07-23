@@ -19,6 +19,16 @@ import {
   generateRoomKey,
   wrapRoomKeyForPeer,
   unwrapRoomKeyFromPeer,
+  createMlsSession,
+  bootstrapGroup,
+  exportKeyPackage,
+  addMember,
+  acceptWelcome,
+  processCommit,
+  removeMember,
+  encryptApp,
+  decryptApp,
+  epochSafetyNumber,
 } from "./index.ts";
 
 describe("X25519 key agreement", () => {
@@ -150,5 +160,56 @@ describe("wire encoding", () => {
   it("round-trips base64", () => {
     const bytes = new Uint8Array([0, 1, 2, 255, 128, 64]);
     assert.deepEqual(fromBase64(toBase64(bytes)), bytes);
+  });
+});
+
+describe("MLS group (RFC 9420)", () => {
+  it("3-party join, message, and remove", async () => {
+    const room = "MLS001";
+    let alice = await createMlsSession("alice", room);
+    let bob = await createMlsSession("bob", room);
+    let charlie = await createMlsSession("charlie", room);
+
+    alice = await bootstrapGroup(alice);
+    assert.ok(epochSafetyNumber(alice));
+
+    const bobKp = exportKeyPackage(bob);
+    const addBob = await addMember(alice, bobKp);
+    alice = addBob.session;
+    bob = await acceptWelcome(bob, addBob.welcomeB64);
+    // existing members process commit (alice already advanced)
+    // bob joined via welcome at new epoch
+
+    const safetyAfterBob = epochSafetyNumber(alice);
+    assert.equal(epochSafetyNumber(bob), safetyAfterBob);
+
+    const charlieKp = exportKeyPackage(charlie);
+    const addCharlie = await addMember(alice, charlieKp);
+    alice = addCharlie.session;
+    bob = await processCommit(bob, addCharlie.commitB64);
+    charlie = await acceptWelcome(charlie, addCharlie.welcomeB64);
+
+    const safety3 = epochSafetyNumber(alice);
+    assert.equal(epochSafetyNumber(bob), safety3);
+    assert.equal(epochSafetyNumber(charlie), safety3);
+
+    const enc = await encryptApp(alice, "hello mls");
+    alice = enc.session;
+    const bobDec = await decryptApp(bob, enc.ciphertextB64);
+    bob = bobDec.session;
+    const charlieDec = await decryptApp(charlie, enc.ciphertextB64);
+    charlie = charlieDec.session;
+    assert.equal(bobDec.text, "hello mls");
+    assert.equal(charlieDec.text, "hello mls");
+
+    const rem = await removeMember(alice, "bob");
+    assert.ok(rem);
+    alice = rem.session;
+    charlie = await processCommit(charlie, rem.commitB64);
+
+    const enc2 = await encryptApp(alice, "after remove");
+    alice = enc2.session;
+    const charlieDec2 = await decryptApp(charlie, enc2.ciphertextB64);
+    assert.equal(charlieDec2.text, "after remove");
   });
 });

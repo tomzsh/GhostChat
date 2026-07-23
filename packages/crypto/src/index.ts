@@ -156,3 +156,22 @@ export function unwrapRoomKeyFromPeer(
 
 // re-export utils sometimes useful for tests
 export { bytesToHex, hexToBytes };
+
+// --- MLS (RFC 9420) group E2EE ---
+export {
+  createMlsSession,
+  bootstrapGroup,
+  exportKeyPackage,
+  addMember,
+  acceptWelcome,
+  processCommit,
+  removeMember,
+  encryptApp,
+  decryptApp,
+  epochSafetyNumber,
+  hasMlsGroup,
+  mlsEpoch,
+  findLeafIndex,
+  MLS_NONCE_MARKER,
+  type MlsSession,
+} from "./mls.js";

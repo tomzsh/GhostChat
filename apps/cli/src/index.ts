@@ -1,20 +1,24 @@
 #!/usr/bin/env node
 /**
- * GhostChat CLI — `ghost create` | `ghost join <ROOM_ID>`
- * Supports 1:1 and small groups (shared room key).
+ * GhostChat CLI — `ghost create` | `ghost join`
+ * MLS (RFC 9420) group E2EE — same protocol as web.
  */
 import WebSocket from "ws";
 import * as readline from "node:readline";
 import {
-  decryptFromWire,
-  encryptToWire,
-  generateKeyPair,
-  generateRoomKey,
-  wrapRoomKeyForPeer,
-  unwrapRoomKeyFromPeer,
-  publicKeyToBase64,
-  publicKeyFromBase64,
-  safetyNumberFromKey,
+  createMlsSession,
+  bootstrapGroup,
+  exportKeyPackage,
+  addMember,
+  acceptWelcome,
+  processCommit,
+  removeMember,
+  encryptApp,
+  decryptApp,
+  epochSafetyNumber,
+  hasMlsGroup,
+  MLS_NONCE_MARKER,
+  type MlsSession,
 } from "@ghostchat/crypto";
 import {
   PROTOCOL_VERSION,
@@ -40,6 +44,8 @@ const API_BASE = process.env.GHOST_API_URL ?? "http://127.0.0.1:8787";
 const WS_BASE = process.env.GHOST_WS_URL ?? API_BASE.replace(/^http/, "ws");
 const WEB_ORIGIN = process.env.GHOST_WEB_URL ?? "http://127.0.0.1:3000";
 
+const KP_RETRY_MS = [300, 1200, 2800, 5500, 9000];
+
 function usage(): never {
   process.stdout.write(ui.banner());
   console.log(
@@ -48,8 +54,11 @@ function usage(): never {
         ui.c.dim(" [--ttl 10s|60s|on_read] [--max N]"),
       ui.c.white("ghost join") + ui.c.dim(" <ROOM_ID>"),
       "",
-      ui.c.dim(`max members  ${LIMITS.minMaxParticipants}–${LIMITS.maxParticipantsCap} (default ${LIMITS.defaultMaxParticipants})`),
+      ui.c.dim(
+        `max members  ${LIMITS.minMaxParticipants}–${LIMITS.maxParticipantsCap} (default ${LIMITS.defaultMaxParticipants})`
+      ),
       ui.c.dim(`env  GHOST_API_URL  GHOST_WS_URL  GHOST_WEB_URL`),
+      ui.c.dim("e2ee  MLS (RFC 9420) via ts-mls"),
     ])
   );
   console.log("");
@@ -85,19 +94,27 @@ async function checkRoom(roomId: string): Promise<void> {
     );
 }
 
+function isCommitter(myId: string, memberIds: string[], hasGroup: boolean) {
+  if (!hasGroup || !myId) return false;
+  const all = [myId, ...memberIds].sort();
+  return all[0] === myId;
+}
+
 async function runSession(roomId: string, defaultTtl: TtlMode) {
-  const keyPair = generateKeyPair();
   const displayId = generateDisplayId();
   const sessionToken = randomChars(24);
-  let roomKey: Uint8Array | null = null;
+  let mls: MlsSession | null = null;
   let safetyNumber: string | null = null;
   let myId = displayId;
-  const members = new Map<string, string>(); // id -> publicKey
+  const members = new Map<string, string>();
+  const pendingKp = new Map<string, string>();
   let maxParticipants: number = 2;
   let participantCount = 1;
   let ttlMode: TtlMode = defaultTtl;
   const burnTimers = new Map<string, NodeJS.Timeout>();
   let cleaned = false;
+  const kpRetryTimers: NodeJS.Timeout[] = [];
+  const adding = new Set<string>();
 
   const ws = new WebSocket(`${WS_BASE}/ws/${roomId}`);
 
@@ -108,12 +125,12 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
     terminal: true,
   });
 
-  function hasPeers() {
-    return members.size > 0;
+  function canSend() {
+    return hasMlsGroup(mls) && members.size > 0;
   }
 
-  function canSend() {
-    return !!roomKey && hasPeers();
+  function setSafety() {
+    safetyNumber = mls ? epochSafetyNumber(mls) : null;
   }
 
   function paintStatus() {
@@ -130,101 +147,72 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
         ui.c.dim("  peers ") +
         peerList +
         ui.c.dim("  burn ") +
-        ui.c.yellow(ttlMode)
+        ui.c.yellow(ttlMode) +
+        ui.c.dim("  mls")
     );
   }
 
   function setPrompt() {
-    rl.setPrompt(
-      ui.promptStr({ ttl: ttlMode, ready: canSend() })
-    );
+    rl.setPrompt(ui.promptStr({ ttl: ttlMode, ready: canSend() }));
     rl.prompt(true);
   }
 
-  function setRoomKey(key: Uint8Array) {
-    roomKey = key;
-    safetyNumber = safetyNumberFromKey(key);
-    clearKeyRequestRetries();
-  }
-
-  const keyShareRetryTimers = new Map<string, NodeJS.Timeout[]>();
-  let keyRequestTimers: NodeJS.Timeout[] = [];
-  const KEY_SHARE_RETRY_MS = [0, 600, 1800, 4000];
-  const KEY_REQUEST_RETRY_MS = [400, 1200, 2800, 5500, 9000];
-
-  function clearKeyShareRetries(peerId?: string) {
-    if (peerId) {
-      const list = keyShareRetryTimers.get(peerId);
-      if (list) {
-        list.forEach(clearTimeout);
-        keyShareRetryTimers.delete(peerId);
-      }
-      return;
+  function sendJson(obj: unknown) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(obj));
     }
-    for (const list of keyShareRetryTimers.values()) list.forEach(clearTimeout);
-    keyShareRetryTimers.clear();
   }
 
-  function clearKeyRequestRetries() {
-    keyRequestTimers.forEach(clearTimeout);
-    keyRequestTimers = [];
+  function broadcastKp() {
+    if (!mls || mls.state) return;
+    sendJson({
+      v: PROTOCOL_VERSION,
+      type: "mls_key_package",
+      package: exportKeyPackage(mls),
+    });
   }
 
-  function shareKeyWith(id: string, publicKey: string) {
-    if (!roomKey || ws.readyState !== WebSocket.OPEN) return;
-    try {
-      const wire = wrapRoomKeyForPeer(
-        keyPair.privateKey,
-        publicKeyFromBase64(publicKey),
-        roomKey,
-        roomId
+  function scheduleKpRetries() {
+    for (const t of kpRetryTimers) clearTimeout(t);
+    kpRetryTimers.length = 0;
+    for (const delay of KP_RETRY_MS) {
+      kpRetryTimers.push(
+        setTimeout(() => {
+          if (!hasMlsGroup(mls)) broadcastKp();
+        }, delay)
       );
-      ws.send(
-        JSON.stringify({
+    }
+  }
+
+  async function tryAddPending() {
+    if (!mls?.state) return;
+    if (!isCommitter(myId, [...members.keys()], true)) return;
+    for (const [peerId, pkg] of [...pendingKp.entries()]) {
+      if (adding.has(peerId) || peerId === myId) continue;
+      adding.add(peerId);
+      try {
+        const result = await addMember(mls, pkg);
+        mls = result.session;
+        setSafety();
+        pendingKp.delete(peerId);
+        sendJson({
           v: PROTOCOL_VERSION,
-          type: "key_share",
-          to: id,
-          ciphertext: wire.ciphertext,
-          nonce: wire.nonce,
-        })
-      );
-    } catch {
-      /* ignore */
-    }
-  }
-
-  /** Share room key + retries (peer may miss the first packet). */
-  function shareKeyWithRetry(id: string, publicKey: string) {
-    clearKeyShareRetries(id);
-    const timers: NodeJS.Timeout[] = [];
-    for (const delay of KEY_SHARE_RETRY_MS) {
-      const t = setTimeout(() => {
-        if (!roomKey || !members.has(id)) return;
-        shareKeyWith(id, publicKey);
-      }, delay);
-      timers.push(t);
-    }
-    keyShareRetryTimers.set(id, timers);
-  }
-
-  function requestRoomKey() {
-    if (roomKey || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(
-      JSON.stringify({
-        v: PROTOCOL_VERSION,
-        type: "key_request",
-      })
-    );
-  }
-
-  function scheduleKeyRequests() {
-    clearKeyRequestRetries();
-    if (roomKey) return;
-    for (const delay of KEY_REQUEST_RETRY_MS) {
-      const t = setTimeout(() => {
-        if (!roomKey) requestRoomKey();
-      }, delay);
-      keyRequestTimers.push(t);
+          type: "mls_welcome",
+          to: peerId,
+          welcome: result.welcomeB64,
+        });
+        sendJson({
+          v: PROTOCOL_VERSION,
+          type: "mls_commit",
+          commit: result.commitB64,
+        });
+        ui.ok(`MLS added · ${peerId}`);
+        if (safetyNumber) process.stdout.write(ui.safetyCard(safetyNumber));
+      } catch (e) {
+        ui.err(e instanceof Error ? e.message : "add member failed");
+      } finally {
+        adding.delete(peerId);
+      }
     }
   }
 
@@ -272,9 +260,9 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
     burnTimers.set(messageId, t);
   }
 
-  function handleServer(msg: ServerMessage) {
+  async function handleServer(msg: ServerMessage) {
     switch (msg.type) {
-      case "joined":
+      case "joined": {
         myId = msg.yourId;
         maxParticipants = msg.maxParticipants ?? 2;
         participantCount = msg.participantCount ?? 1;
@@ -282,86 +270,108 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
         members.clear();
         const peers: PeerInfo[] =
           msg.peers ??
-          (msg.peerId && msg.peerPublicKey
-            ? [{ id: msg.peerId, publicKey: msg.peerPublicKey }]
+          (msg.peerId
+            ? [{ id: msg.peerId, publicKey: msg.peerPublicKey ?? "mls" }]
             : []);
-        for (const p of peers) members.set(p.id, p.publicKey);
+        for (const p of peers) members.set(p.id, p.publicKey || "mls");
+
+        mls = await createMlsSession(myId, roomId);
         if (members.size === 0) {
-          setRoomKey(generateRoomKey());
-          ui.warn("waiting for peers — share the room code");
+          mls = await bootstrapGroup(mls);
+          setSafety();
+          ui.warn("waiting for peers — share the room code (MLS group ready)");
         } else {
           ui.sys(`peers online: ${[...members.keys()].join(", ")}`);
-          ui.warn("waiting for room key…");
-          scheduleKeyRequests();
+          ui.warn("waiting for MLS welcome…");
+          broadcastKp();
+          scheduleKpRetries();
         }
         if (safetyNumber) process.stdout.write(ui.safetyCard(safetyNumber));
         paintStatus();
         setPrompt();
         break;
+      }
       case "peer_joined":
-        members.set(msg.peerId, msg.peerPublicKey);
+        members.set(msg.peerId, msg.peerPublicKey || "mls");
         participantCount = msg.participantCount ?? members.size + 1;
         ui.ok(ui.c.white("peer joined · ") + ui.c.cyan(msg.peerId));
-        if (roomKey) {
-          shareKeyWithRetry(msg.peerId, msg.peerPublicKey);
-        } else {
-          scheduleKeyRequests();
-        }
         paintStatus();
         setPrompt();
         break;
-      case "peer_left":
+      case "peer_left": {
         members.delete(msg.peerId);
-        clearKeyShareRetries(msg.peerId);
+        pendingKp.delete(msg.peerId);
         participantCount = msg.participantCount ?? members.size + 1;
         ui.warn(`peer left · ${msg.peerId}`);
-        paintStatus();
-        setPrompt();
-        break;
-      case "key_share":
-        if (msg.to !== myId || roomKey) break;
-        try {
-          const pk = members.get(msg.from);
-          if (!pk) break;
-          const key = unwrapRoomKeyFromPeer(
-            keyPair.privateKey,
-            publicKeyFromBase64(pk),
-            msg.ciphertext,
-            msg.nonce,
-            roomId
-          );
-          setRoomKey(key);
-          ui.ok("room key received · channel open");
-          if (safetyNumber) process.stdout.write(ui.safetyCard(safetyNumber));
-          // One-shot mesh; peers can key_request if still missing
-          for (const [id, publicKey] of members) {
-            if (id === msg.from) continue;
-            shareKeyWith(id, publicKey);
+        if (
+          mls?.state &&
+          isCommitter(myId, [...members.keys()], true)
+        ) {
+          try {
+            const rem = await removeMember(mls, msg.peerId);
+            if (rem) {
+              mls = rem.session;
+              setSafety();
+              sendJson({
+                v: PROTOCOL_VERSION,
+                type: "mls_commit",
+                commit: rem.commitB64,
+              });
+              ui.sys("MLS remove commit sent");
+            }
+          } catch {
+            /* ignore */
           }
-        } catch {
-          ui.err("failed to unwrap room key");
         }
         paintStatus();
         setPrompt();
         break;
-      case "key_request": {
-        // Requester retries key_request — reply once to avoid share storms
-        if (!roomKey || !msg.from) break;
-        const pk = members.get(msg.from);
-        if (!pk) break;
-        shareKeyWith(msg.from, pk);
-        break;
       }
-      case "message":
-        if (!roomKey) break;
+      case "mls_key_package":
+        if (!msg.from || msg.from === myId) break;
+        pendingKp.set(msg.from, msg.package);
+        await tryAddPending();
+        setPrompt();
+        break;
+      case "mls_welcome":
+        if (msg.to !== myId) break;
+        if (hasMlsGroup(mls)) break;
         try {
-          const text = decryptFromWire(
-            roomKey,
-            msg.ciphertext,
-            msg.nonce
-          );
-          ui.msgPeer(msg.from, text, msg.ttlMode);
-          scheduleBurn(msg.messageId, msg.ttlMode, false);
+          if (!mls) mls = await createMlsSession(myId, roomId);
+          mls = await acceptWelcome(mls, msg.welcome);
+          setSafety();
+          for (const t of kpRetryTimers) clearTimeout(t);
+          ui.ok("MLS welcome · channel open");
+          if (safetyNumber) process.stdout.write(ui.safetyCard(safetyNumber));
+          await tryAddPending();
+        } catch {
+          ui.err("failed to accept MLS welcome");
+        }
+        paintStatus();
+        setPrompt();
+        break;
+      case "mls_commit":
+        if (msg.from === myId) break;
+        if (!mls?.state) break;
+        try {
+          mls = await processCommit(mls, msg.commit);
+          setSafety();
+          ui.sys("MLS epoch advanced");
+          await tryAddPending();
+        } catch {
+          ui.err("MLS commit process failed");
+        }
+        setPrompt();
+        break;
+      case "message":
+        if (!mls?.state) break;
+        try {
+          const result = await decryptApp(mls, msg.ciphertext);
+          mls = result.session;
+          if (result.text) {
+            ui.msgPeer(msg.from, result.text, msg.ttlMode);
+            scheduleBurn(msg.messageId, msg.ttlMode, false);
+          }
         } catch {
           ui.err("decrypt failed");
         }
@@ -376,9 +386,7 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
         setPrompt();
         break;
       case "error":
-        ui.err(
-          `${msg.code}${msg.message ? ": " + msg.message : ""}`
-        );
+        ui.err(`${msg.code}${msg.message ? ": " + msg.message : ""}`);
         if (msg.code === "room_full" || msg.code === "room_not_found") {
           cleanup(1);
         }
@@ -397,9 +405,7 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
     if (cleaned) return;
     cleaned = true;
     burnTimers.forEach((t) => clearTimeout(t));
-    clearKeyShareRetries();
-    clearKeyRequestRetries();
-    keyPair.privateKey.fill(0);
+    for (const t of kpRetryTimers) clearTimeout(t);
     try {
       ws.close();
     } catch {
@@ -421,19 +427,21 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
         v: PROTOCOL_VERSION,
         type: "join",
         displayId,
-        publicKey: publicKeyToBase64(keyPair.publicKey),
+        publicKey: "mls",
         sessionToken,
       })
     );
   });
 
   ws.on("message", (data) => {
-    try {
-      const msg = parseServerMessage(JSON.parse(String(data)));
-      if (msg) handleServer(msg);
-    } catch {
-      /* */
-    }
+    void (async () => {
+      try {
+        const msg = parseServerMessage(JSON.parse(String(data)));
+        if (msg) await handleServer(msg);
+      } catch {
+        /* */
+      }
+    })();
   });
 
   ws.on("error", (e) => {
@@ -456,85 +464,88 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
   }, 25000);
 
   rl.on("line", (line) => {
-    const input = line.trim();
-    if (!input) {
-      setPrompt();
-      return;
-    }
+    void (async () => {
+      const input = line.trim();
+      if (!input) {
+        setPrompt();
+        return;
+      }
 
-    if (input === "/quit" || input === "/exit" || input === "/q") {
-      clearInterval(ping);
-      cleanup(0);
-      return;
-    }
+      if (input === "/quit" || input === "/exit" || input === "/q") {
+        clearInterval(ping);
+        cleanup(0);
+        return;
+      }
 
-    if (input === "/who" || input === "/status") {
-      paintStatus();
-      if (safetyNumber) process.stdout.write(ui.safetyCard(safetyNumber));
-      setPrompt();
-      return;
-    }
-
-    if (input === "/safety" || input === "/fp") {
-      if (safetyNumber) process.stdout.write(ui.safetyCard(safetyNumber));
-      else ui.warn("no safety number yet");
-      setPrompt();
-      return;
-    }
-
-    if (input === "/help" || input === "/?") {
-      ui.printLine(ui.helpInline());
-      setPrompt();
-      return;
-    }
-
-    if (input.startsWith("/ttl")) {
-      const mode = input.slice(4).trim();
-      if (!mode) ui.sys(`current burn: ${ttlMode}`);
-      else if (isValidTtlMode(mode)) {
-        ttlMode = mode;
-        ui.ok(`burn after → ${ui.c.yellow(ttlMode)}`);
+      if (input === "/who" || input === "/status") {
         paintStatus();
-      } else ui.err("usage: /ttl on_read|10s|60s");
-      setPrompt();
-      return;
-    }
+        if (safetyNumber) process.stdout.write(ui.safetyCard(safetyNumber));
+        setPrompt();
+        return;
+      }
 
-    if (input.startsWith("/")) {
-      ui.warn("unknown command — try /help");
-      setPrompt();
-      return;
-    }
+      if (input === "/safety" || input === "/fp") {
+        if (safetyNumber) process.stdout.write(ui.safetyCard(safetyNumber));
+        else ui.warn("no safety number yet");
+        setPrompt();
+        return;
+      }
 
-    if (!canSend() || !roomKey) {
-      ui.warn(
-        members.size === 0
-          ? "waiting for peers — message not sent"
-          : "encryption not ready — message not sent"
-      );
-      setPrompt();
-      return;
-    }
+      if (input === "/help" || input === "/?") {
+        ui.printLine(ui.helpInline());
+        setPrompt();
+        return;
+      }
 
-    try {
-      const messageId = generateMessageId();
-      const wire = encryptToWire(roomKey, input);
-      ws.send(
-        JSON.stringify({
-          v: PROTOCOL_VERSION,
-          type: "message",
-          ciphertext: wire.ciphertext,
-          nonce: wire.nonce,
-          ttlMode,
-          messageId,
-        })
-      );
-      ui.msgYou(input, ttlMode);
-      scheduleBurn(messageId, ttlMode, true);
-    } catch (e) {
-      ui.err(e instanceof Error ? e.message : "send failed");
-    }
-    setPrompt();
+      if (input.startsWith("/ttl")) {
+        const mode = input.slice(4).trim();
+        if (!mode) ui.sys(`current burn: ${ttlMode}`);
+        else if (isValidTtlMode(mode)) {
+          ttlMode = mode;
+          ui.ok(`burn after → ${ui.c.yellow(ttlMode)}`);
+          paintStatus();
+        } else ui.err("usage: /ttl on_read|10s|60s");
+        setPrompt();
+        return;
+      }
+
+      if (input.startsWith("/")) {
+        ui.warn("unknown command — try /help");
+        setPrompt();
+        return;
+      }
+
+      if (!canSend() || !mls?.state) {
+        ui.warn(
+          members.size === 0
+            ? "waiting for peers — message not sent"
+            : "MLS not ready — message not sent"
+        );
+        setPrompt();
+        return;
+      }
+
+      try {
+        const messageId = generateMessageId();
+        const enc = await encryptApp(mls, input);
+        mls = enc.session;
+        ws.send(
+          JSON.stringify({
+            v: PROTOCOL_VERSION,
+            type: "message",
+            ciphertext: enc.ciphertextB64,
+            nonce: MLS_NONCE_MARKER,
+            ttlMode,
+            messageId,
+          })
+        );
+        ui.msgYou(input, ttlMode);
+        scheduleBurn(messageId, ttlMode, true);
+      } catch (e) {
+        ui.err(e instanceof Error ? e.message : "send failed");
+      }
+      setPrompt();
+    })();
   });
 
   rl.on("close", () => {
@@ -544,7 +555,7 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
 
   process.stdout.write(ui.sessionHeader(roomId));
   paintStatus();
-  ui.sys("opening encrypted relay…");
+  ui.sys("opening MLS encrypted relay…");
 }
 
 async function main() {
@@ -573,10 +584,7 @@ async function main() {
     ui.sys(`creating room (max ${max})…`);
     const { roomId, maxParticipants } = await createRoom(max);
     process.stdout.write(
-      ui.roomCreatedCard(
-        roomId,
-        `${WEB_ORIGIN}/r/${roomId}`
-      )
+      ui.roomCreatedCard(roomId, `${WEB_ORIGIN}/r/${roomId}`)
     );
     ui.sys(`max members: ${maxParticipants}`);
     await runSession(roomId, ttl);

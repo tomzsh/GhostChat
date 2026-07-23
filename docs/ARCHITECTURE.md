@@ -24,11 +24,12 @@ Operational rules for agents: see [AGENTS.md](../AGENTS.md).
 - HTTP router: create room, status, health, WebSocket upgrade.
 - Rate limits (in-isolate sliding window) on create and join probes.
 - **RoomDurableObject**:
-  - Accepts up to 2 live sessions.
-  - Relays `message`, `typing`, `burn`.
+  - Accepts up to `maxParticipants` (2–20) unique sessions.
+  - Relays `message`, `typing`, `burn`, `mls_key_package`, `mls_welcome` (unicast), `mls_commit`.
   - Emits `joined`, `peer_joined`, `peer_left`, `room_closed`, `error`.
   - Replaced sockets tagged `__replaced` to avoid false leave events.
   - Alarms: empty grace, idle timeout, max age.
+  - Never holds MLS group state or keys.
 
 ### `apps/cli`
 
@@ -41,7 +42,7 @@ Operational rules for agents: see [AGENTS.md](../AGENTS.md).
 |---|---|
 | `shared` | IDs, limits, TTL |
 | `protocol` | Typed WS frames |
-| `crypto` | Client-side E2EE + safety number |
+| `crypto` | MLS (RFC 9420) + legacy pairwise helpers + safety number |
 
 ## Trust boundaries
 
@@ -57,12 +58,13 @@ Attack surface of interest:
 - MITM on first join if code channel is hostile → safety number comparison.
 - Endpoint compromise → out of scope.
 
-## Message path
+## Message path (MLS)
 
-1. Client A encrypts with shared key → WS `message` frame.
-2. DO validates rate/size/TTL mode, finds live peer sockets.
-3. DO forwards frame to peer(s).
-4. Client B decrypts; optional `burn` syncs UI deletion.
+1. First member `createGroup`; joiners broadcast `mls_key_package`.
+2. Committer `createCommit(Add)` → unicast `mls_welcome` + broadcast `mls_commit`.
+3. Chat: `createApplicationMessage` → WS `message` (MLS PrivateMessage).
+4. Peers `processPrivateMessage`; optional `burn` syncs UI deletion.
+5. On leave, committer may `Remove` + broadcast `mls_commit`.
 
 ## Lifecycle
 
@@ -78,4 +80,4 @@ Attack surface of interest:
 - New control frames: add to `packages/protocol` first, then worker + both clients.
 - New crypto: keep behind `packages/crypto` API; add tests.
 - New UI: keep mobile `app-shell` height model intact.
-- Group chat: design MLS (or equivalent) before coding slots > 2.
+- MLS: keep server crypto-free; change wire types in `packages/protocol` first.

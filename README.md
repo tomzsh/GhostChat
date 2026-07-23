@@ -6,10 +6,10 @@
 
 <p align="center">
   <strong>English</strong> · <a href="./README.id.md">Bahasa Indonesia</a>
-  · <a href="https://github.com/tomzsh/ghostchat/releases/tag/v1.1.0">v1.1.0</a>
+  · <a href="https://github.com/tomzsh/ghostchat/releases/tag/v2.0.0">v2.0.0</a>
 </p>
 
-Anonymous, **ephemeral**, **end-to-end encrypted** 1:1 chat.  
+Anonymous, **ephemeral**, **end-to-end encrypted** chat (1:1 and small groups via **MLS**).  
 No accounts. No permanent history. No plaintext on the server.
 
 > Privacy by design: the server is only a **relay** for ciphertext. When a room is empty, its in-memory state is destroyed.
@@ -44,14 +44,14 @@ No accounts. No permanent history. No plaintext on the server.
 
 ## Overview
 
-GhostChat solves a narrow problem: **talk to one other person, right now, privately, and leave no durable trace**.
+GhostChat solves a narrow problem: **talk privately right now, and leave no durable trace**.
 
 | Concern | Behavior |
 |---|---|
 | Identity | Random `Anon-XXXX` per session — no signup |
 | Storage | No message history on the server |
-| Encryption | X25519 + HKDF-SHA256 + XChaCha20-Poly1305 on clients |
-| Room access | 6-character code (or link / QR) |
+| Encryption | **MLS (RFC 9420)** on clients (`ts-mls`); server relays ciphertext only |
+| Room access | 6-character code (or link / QR); creator sets max members 2–20 |
 | Lifecycle | Destroyed when empty, idle 10 min, or max age 24 h |
 
 Clients: **Web (Next.js)** and **CLI (`ghost`)** share the same Cloudflare Worker backend.
@@ -62,9 +62,9 @@ Clients: **Web (Next.js)** and **CLI (`ghost`)** share the same Cloudflare Worke
 
 ### Product (MVP)
 
-- Create / join 1:1 rooms (max 2 participants)
+- Create / join rooms (max **2–20** members, creator chooses)
 - Realtime chat over WebSocket
-- End-to-end encryption (keys never leave the client)
+- End-to-end encryption with **MLS** (keys never leave the client)
 - Typing indicator + animated ASCII “people chatting” (web)
 - Message self-destruct (**Burn after**: read / 10s / 60s)
 - **Safety number** — both peers compare digits to detect MITM
@@ -117,7 +117,7 @@ ghostchat/
 │   ├── worker/              # Cloudflare Worker + Room Durable Object
 │   └── cli/                 # ghost create | ghost join
 ├── packages/
-│   ├── crypto/              # X25519, HKDF, XChaCha20-Poly1305, safety number
+│   ├── crypto/              # MLS (ts-mls) + legacy pairwise helpers
 │   ├── protocol/            # Shared WS message types & parsers
 │   └── shared/              # Room codes, limits, TTL helpers
 ├── package.json             # pnpm workspace root
@@ -299,16 +299,17 @@ Shared TypeScript types live in `packages/protocol`.
 
 | Step | Algorithm | Library |
 |---|---|---|
-| Key agreement | X25519 ECDH | `@noble/curves` |
-| KDF | HKDF-SHA256 (`info = ghostchat:<roomId>`) | `@noble/hashes` |
-| AEAD | XChaCha20-Poly1305 (24-byte nonce) | `@noble/ciphers` |
-| Safety number | SHA-256 of shared key → `XXXXX XXXXX XXXXX` | `@noble/hashes` |
+| Group E2EE | **MLS (RFC 9420)** | `ts-mls` |
+| Ciphersuite | MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 | `ts-mls` / `@hpke/core` |
+| Safety number | SHA-256 of MLS `confirmedTranscriptHash` → `XXXXX XXXXX XXXXX` | `@noble/hashes` |
+| Protocol | `PROTOCOL_VERSION = 2` | `@ghostchat/protocol` |
 
 **Rules:**
 
-- Private keys stay in process / tab memory only
-- Server sees public keys + ciphertext + presence metadata only
-- Safety number must match on both devices; if not, treat the channel as compromised
+- Private keys and MLS group state stay in process / tab memory only
+- Server sees MLS ciphertext frames + presence metadata only (never group secrets)
+- Safety number is epoch-bound — re-compare after joins; mismatch ⇒ treat as compromised
+- `ts-mls` is not formally audited
 
 ---
 
@@ -447,7 +448,7 @@ Possible later work (not required for MVP):
 - Longer reconnect grace on the server  
 - Optional room passphrase  
 - In-app QR scanner  
-- Group chat (requires MLS or similar — not a simple slot increase)
+- Post-quantum MLS ciphersuites (X-Wing / ML-KEM)
 
 Out of scope by design: accounts, cloud history, push notifications, server-side content moderation of plaintext.
 

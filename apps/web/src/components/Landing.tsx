@@ -180,8 +180,8 @@ export function Landing() {
 
         <p className="text-[11px] leading-relaxed text-ghost-dim sm:text-xs">
           Tip: create a room, share the code or{" "}
-          <strong className="text-ghost-green">QR</strong>. All members use the
-          same room key (E2EE).
+          <strong className="text-ghost-green">QR</strong>. Members join via{" "}
+          <strong className="text-ghost-green">MLS</strong> (E2EE).
         </p>
 
         <details className="border border-ghost-border/60 p-3 text-xs text-ghost-dim">
@@ -190,7 +190,7 @@ export function Landing() {
           </summary>
           <ul className="mt-2 list-disc space-y-1.5 pl-4 leading-relaxed">
             <li>
-              Protected: message contents (E2EE group room key), no permanent
+              Protected: message contents (MLS group encryption), no permanent
               server storage, no accounts.
             </li>
             <li>

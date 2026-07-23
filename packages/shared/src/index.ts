@@ -49,7 +49,10 @@ export const LIMITS = {
   /** @deprecated use maxParticipantsCap — kept for older imports */
   maxParticipants: 20,
   maxMessagesPerSecond: 5,
-  maxCiphertextBytes: 4 * 1024,
+  /** MLS PrivateMessage / Welcome / Commit can exceed small AEAD blobs. */
+  maxCiphertextBytes: 48 * 1024,
+  /** Max base64 size for MLS control frames (key package, welcome, commit). */
+  maxMlsPayloadBytes: 96 * 1024,
   idleTimeoutMs: 10 * 60 * 1000,
   maxAgeMs: 24 * 60 * 60 * 1000,
   reconnectGraceMs: 30 * 1000,
