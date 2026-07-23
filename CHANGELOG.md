@@ -17,6 +17,11 @@ All notable changes to GhostChat are documented in this file.
 - KeyPackage retry while waiting for Welcome
 - Unit test: 3-party join + message + remove
 
+### Fixed (post-release hardening)
+- Committer election excludes pending joiners (avoids deadlock when joiner id &lt; creator id)
+- Sequential `addMember` always uses latest MLS state
+- MLS ops serialized on a queue (web + CLI) to prevent epoch races
+
 ### Notes
 - Server still never sees plaintext or private keys
 - `ts-mls` is not formally audited — use at your own risk for high-threat scenarios

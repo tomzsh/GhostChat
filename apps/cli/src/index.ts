@@ -94,10 +94,20 @@ async function checkRoom(roomId: string): Promise<void> {
     );
 }
 
-function isCommitter(myId: string, memberIds: string[], hasGroup: boolean) {
+/** Elect committer among members already in MLS (exclude pending joiners). */
+function isCommitter(
+  myId: string,
+  memberIds: string[],
+  hasGroup: boolean,
+  pendingJoiners: Iterable<string> = []
+) {
   if (!hasGroup || !myId) return false;
-  const all = [myId, ...memberIds].sort();
-  return all[0] === myId;
+  const pending = new Set(pendingJoiners);
+  const candidates = [
+    myId,
+    ...memberIds.filter((id) => id !== myId && !pending.has(id)),
+  ].sort();
+  return candidates[0] === myId;
 }
 
 async function runSession(roomId: string, defaultTtl: TtlMode) {
@@ -184,36 +194,51 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
     }
   }
 
+  let mlsOp: Promise<void> = Promise.resolve();
+  function enqueueMls<T>(fn: () => Promise<T>): Promise<T> {
+    const run = mlsOp.then(fn, fn);
+    mlsOp = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }
+
   async function tryAddPending() {
-    if (!mls?.state) return;
-    if (!isCommitter(myId, [...members.keys()], true)) return;
-    for (const [peerId, pkg] of [...pendingKp.entries()]) {
-      if (adding.has(peerId) || peerId === myId) continue;
-      adding.add(peerId);
-      try {
-        const result = await addMember(mls, pkg);
-        mls = result.session;
-        setSafety();
-        pendingKp.delete(peerId);
-        sendJson({
-          v: PROTOCOL_VERSION,
-          type: "mls_welcome",
-          to: peerId,
-          welcome: result.welcomeB64,
-        });
-        sendJson({
-          v: PROTOCOL_VERSION,
-          type: "mls_commit",
-          commit: result.commitB64,
-        });
-        ui.ok(`MLS added · ${peerId}`);
-        if (safetyNumber) process.stdout.write(ui.safetyCard(safetyNumber));
-      } catch (e) {
-        ui.err(e instanceof Error ? e.message : "add member failed");
-      } finally {
-        adding.delete(peerId);
+    return enqueueMls(async () => {
+      if (!mls?.state) return;
+      if (!isCommitter(myId, [...members.keys()], true, pendingKp.keys())) {
+        return;
       }
-    }
+      for (const [peerId, pkg] of [...pendingKp.entries()]) {
+        if (!mls?.state) return;
+        if (adding.has(peerId) || peerId === myId) continue;
+        adding.add(peerId);
+        try {
+          const result = await addMember(mls, pkg);
+          mls = result.session;
+          setSafety();
+          pendingKp.delete(peerId);
+          sendJson({
+            v: PROTOCOL_VERSION,
+            type: "mls_welcome",
+            to: peerId,
+            welcome: result.welcomeB64,
+          });
+          sendJson({
+            v: PROTOCOL_VERSION,
+            type: "mls_commit",
+            commit: result.commitB64,
+          });
+          ui.ok(`MLS added · ${peerId}`);
+          if (safetyNumber) process.stdout.write(ui.safetyCard(safetyNumber));
+        } catch (e) {
+          ui.err(e instanceof Error ? e.message : "add member failed");
+        } finally {
+          adding.delete(peerId);
+        }
+      }
+    });
   }
 
   function burn(id: string) {
@@ -303,25 +328,35 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
         pendingKp.delete(msg.peerId);
         participantCount = msg.participantCount ?? members.size + 1;
         ui.warn(`peer left · ${msg.peerId}`);
-        if (
-          mls?.state &&
-          isCommitter(myId, [...members.keys()], true)
-        ) {
-          try {
-            const rem = await removeMember(mls, msg.peerId);
-            if (rem) {
-              mls = rem.session;
-              setSafety();
-              sendJson({
-                v: PROTOCOL_VERSION,
-                type: "mls_commit",
-                commit: rem.commitB64,
-              });
-              ui.sys("MLS remove commit sent");
+        if (mls?.state) {
+          await enqueueMls(async () => {
+            if (
+              !mls?.state ||
+              !isCommitter(
+                myId,
+                [...members.keys()],
+                true,
+                pendingKp.keys()
+              )
+            ) {
+              return;
             }
-          } catch {
-            /* ignore */
-          }
+            try {
+              const rem = await removeMember(mls, msg.peerId);
+              if (rem) {
+                mls = rem.session;
+                setSafety();
+                sendJson({
+                  v: PROTOCOL_VERSION,
+                  type: "mls_commit",
+                  commit: rem.commitB64,
+                });
+                ui.sys("MLS remove commit sent");
+              }
+            } catch {
+              /* ignore */
+            }
+          });
         }
         paintStatus();
         setPrompt();
@@ -337,12 +372,15 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
         if (msg.to !== myId) break;
         if (hasMlsGroup(mls)) break;
         try {
-          if (!mls) mls = await createMlsSession(myId, roomId);
-          mls = await acceptWelcome(mls, msg.welcome);
-          setSafety();
-          for (const t of kpRetryTimers) clearTimeout(t);
-          ui.ok("MLS welcome · channel open");
-          if (safetyNumber) process.stdout.write(ui.safetyCard(safetyNumber));
+          await enqueueMls(async () => {
+            if (hasMlsGroup(mls)) return;
+            if (!mls) mls = await createMlsSession(myId, roomId);
+            mls = await acceptWelcome(mls, msg.welcome);
+            setSafety();
+            for (const t of kpRetryTimers) clearTimeout(t);
+            ui.ok("MLS welcome · channel open");
+            if (safetyNumber) process.stdout.write(ui.safetyCard(safetyNumber));
+          });
           await tryAddPending();
         } catch {
           ui.err("failed to accept MLS welcome");
@@ -354,9 +392,12 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
         if (msg.from === myId) break;
         if (!mls?.state) break;
         try {
-          mls = await processCommit(mls, msg.commit);
-          setSafety();
-          ui.sys("MLS epoch advanced");
+          await enqueueMls(async () => {
+            if (!mls?.state) return;
+            mls = await processCommit(mls, msg.commit);
+            setSafety();
+            ui.sys("MLS epoch advanced");
+          });
           await tryAddPending();
         } catch {
           ui.err("MLS commit process failed");
@@ -366,12 +407,15 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
       case "message":
         if (!mls?.state) break;
         try {
-          const result = await decryptApp(mls, msg.ciphertext);
-          mls = result.session;
-          if (result.text) {
-            ui.msgPeer(msg.from, result.text, msg.ttlMode);
-            scheduleBurn(msg.messageId, msg.ttlMode, false);
-          }
+          await enqueueMls(async () => {
+            if (!mls?.state) return;
+            const result = await decryptApp(mls, msg.ciphertext);
+            mls = result.session;
+            if (result.text) {
+              ui.msgPeer(msg.from, result.text, msg.ttlMode);
+              scheduleBurn(msg.messageId, msg.ttlMode, false);
+            }
+          });
         } catch {
           ui.err("decrypt failed");
         }
@@ -526,21 +570,24 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
       }
 
       try {
-        const messageId = generateMessageId();
-        const enc = await encryptApp(mls, input);
-        mls = enc.session;
-        ws.send(
-          JSON.stringify({
-            v: PROTOCOL_VERSION,
-            type: "message",
-            ciphertext: enc.ciphertextB64,
-            nonce: MLS_NONCE_MARKER,
-            ttlMode,
-            messageId,
-          })
-        );
-        ui.msgYou(input, ttlMode);
-        scheduleBurn(messageId, ttlMode, true);
+        await enqueueMls(async () => {
+          if (!mls?.state) throw new Error("MLS not ready");
+          const messageId = generateMessageId();
+          const enc = await encryptApp(mls, input);
+          mls = enc.session;
+          ws.send(
+            JSON.stringify({
+              v: PROTOCOL_VERSION,
+              type: "message",
+              ciphertext: enc.ciphertextB64,
+              nonce: MLS_NONCE_MARKER,
+              ttlMode,
+              messageId,
+            })
+          );
+          ui.msgYou(input, ttlMode);
+          scheduleBurn(messageId, ttlMode, true);
+        });
       } catch (e) {
         ui.err(e instanceof Error ? e.message : "send failed");
       }

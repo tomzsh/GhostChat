@@ -71,17 +71,24 @@ const MAX_RECONNECT = 6;
 /** Re-broadcast KeyPackage while waiting for Welcome. */
 const KP_RETRY_MS = [300, 1200, 2800, 5500, 9000] as const;
 
+/**
+ * Elect committer among members already in the MLS group.
+ * Pending KeyPackage peers are NOT candidates (they are still joining) —
+ * otherwise a smaller-id joiner deadlocks the creator who holds the group.
+ */
 function isCommitter(
   myId: string,
   memberIds: string[],
-  hasGroup: boolean
+  hasGroup: boolean,
+  pendingJoiners: Iterable<string> = []
 ): boolean {
   if (!hasGroup || !myId) return false;
-  // Among self + peers that we know, smallest id with group is committer.
-  // We only know that *we* have group state; elect among myId and peers:
-  // if myId is the lexicographically smallest among (myId + members), we commit.
-  const all = [myId, ...memberIds].sort();
-  return all[0] === myId;
+  const pending = new Set(pendingJoiners);
+  const candidates = [
+    myId,
+    ...memberIds.filter((id) => id !== myId && !pending.has(id)),
+  ].sort();
+  return candidates[0] === myId;
 }
 
 export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
@@ -114,6 +121,8 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
   /** Avoid double-add races. */
   const addingPeer = useRef<Set<string>>(new Set());
   const removingPeer = useRef<Set<string>>(new Set());
+  /** Serialize MLS ops so concurrent decrypt/commit/encrypt cannot race epoch. */
+  const mlsQueue = useRef(Promise.resolve());
   const ttlModeRef = useRef(ttlMode);
   const myIdRef = useRef(myId);
   const lastTypingSent = useRef(false);
@@ -122,6 +131,16 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
   ttlModeRef.current = ttlMode;
   myIdRef.current = myId;
   membersRef.current = members;
+
+  const enqueueMls = useCallback(<T,>(fn: () => Promise<T>): Promise<T> => {
+    const next = mlsQueue.current.then(fn, fn);
+    // Keep queue alive after failures
+    mlsQueue.current = next.then(
+      () => undefined,
+      () => undefined
+    );
+    return next;
+  }, []);
 
   const clearBurnTimers = useCallback(() => {
     burnTimers.current.forEach((t) => clearTimeout(t));
@@ -174,49 +193,54 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
   }, [broadcastKeyPackage, clearKpRetries]);
 
   const tryAddPending = useCallback(async () => {
-    const session = mlsRef.current;
-    const my = myIdRef.current;
-    if (!session?.state || !my) return;
-    if (
-      !isCommitter(
-        my,
-        membersRef.current.map((m) => m.id),
-        true
-      )
-    ) {
-      return;
-    }
-
-    for (const [peerId, pkg] of [...pendingKp.current.entries()]) {
-      if (addingPeer.current.has(peerId)) continue;
-      if (peerId === my) continue;
-      addingPeer.current.add(peerId);
-      try {
-        const result = await addMember(session, pkg);
-        persistMls(result.session);
-        pendingKp.current.delete(peerId);
-        sendJson({
-          v: PROTOCOL_VERSION,
-          type: "mls_welcome",
-          to: peerId,
-          welcome: result.welcomeB64,
-        });
-        sendJson({
-          v: PROTOCOL_VERSION,
-          type: "mls_commit",
-          commit: result.commitB64,
-        });
-        setState("ready");
-        setError(null);
-      } catch (e) {
-        setError(
-          e instanceof Error ? e.message : "Failed to add peer to MLS group"
-        );
-      } finally {
-        addingPeer.current.delete(peerId);
+    return enqueueMls(async () => {
+      const my = myIdRef.current;
+      if (!mlsRef.current?.state || !my) return;
+      if (
+        !isCommitter(
+          my,
+          membersRef.current.map((m) => m.id),
+          true,
+          pendingKp.current.keys()
+        )
+      ) {
+        return;
       }
-    }
-  }, [persistMls, sendJson]);
+
+      for (const [peerId, pkg] of [...pendingKp.current.entries()]) {
+        // Re-read latest state each iteration (epoch advances after each add)
+        const session = mlsRef.current;
+        if (!session?.state) return;
+        if (addingPeer.current.has(peerId)) continue;
+        if (peerId === my) continue;
+        addingPeer.current.add(peerId);
+        try {
+          const result = await addMember(session, pkg);
+          persistMls(result.session);
+          pendingKp.current.delete(peerId);
+          sendJson({
+            v: PROTOCOL_VERSION,
+            type: "mls_welcome",
+            to: peerId,
+            welcome: result.welcomeB64,
+          });
+          sendJson({
+            v: PROTOCOL_VERSION,
+            type: "mls_commit",
+            commit: result.commitB64,
+          });
+          setState("ready");
+          setError(null);
+        } catch (e) {
+          setError(
+            e instanceof Error ? e.message : "Failed to add peer to MLS group"
+          );
+        } finally {
+          addingPeer.current.delete(peerId);
+        }
+      }
+    });
+  }, [enqueueMls, persistMls, sendJson]);
 
   const burnMessage = useCallback((messageId: string, notifyPeer: boolean) => {
     setMessages((prev) => {
@@ -341,7 +365,7 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
         setTypingPeers((prev) => prev.filter((id) => id !== leftId));
         pendingKp.current.delete(leftId);
 
-        void (async () => {
+        void enqueueMls(async () => {
           const session = mlsRef.current;
           const my = myIdRef.current;
           if (!session?.state || !my || !leftId) return;
@@ -349,7 +373,11 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
           const membersLeft = membersRef.current
             .map((m) => m.id)
             .filter((id) => id !== leftId);
-          if (!isCommitter(my, membersLeft, true)) return;
+          if (
+            !isCommitter(my, membersLeft, true, pendingKp.current.keys())
+          ) {
+            return;
+          }
           removingPeer.current.add(leftId);
           try {
             const rem = await removeMember(session, leftId);
@@ -366,19 +394,17 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
           } finally {
             removingPeer.current.delete(leftId);
           }
-        })();
+        });
         break;
       }
       case "mls_key_package": {
-        void (async () => {
-          if (!msg.from || msg.from === myIdRef.current) return;
-          pendingKp.current.set(msg.from, msg.package);
-          await tryAddPending();
-        })();
+        if (!msg.from || msg.from === myIdRef.current) break;
+        pendingKp.current.set(msg.from, msg.package);
+        void tryAddPending();
         break;
       }
       case "mls_welcome": {
-        void (async () => {
+        void enqueueMls(async () => {
           if (msg.to !== myIdRef.current) return;
           if (hasMlsGroup(mlsRef.current)) return;
           try {
@@ -391,18 +417,18 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
             clearKpRetries();
             setState("ready");
             setError(null);
-            // After joining, we may need to add others if we become committer
-            void tryAddPending();
           } catch (e) {
             setError(
               e instanceof Error ? e.message : "Failed to accept MLS welcome"
             );
           }
-        })();
+        }).then(() => {
+          void tryAddPending();
+        });
         break;
       }
       case "mls_commit": {
-        void (async () => {
+        void enqueueMls(async () => {
           if (msg.from === myIdRef.current) return;
           const session = mlsRef.current;
           if (!session?.state) return;
@@ -413,16 +439,17 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
               setState("ready");
             }
             setError(null);
-            void tryAddPending();
           } catch {
-            // Epoch desync — re-request via KP retry if we somehow lost group
+            // Epoch desync — joiner can re-broadcast KP; members stay on last epoch
             setError("MLS commit failed (epoch?)");
           }
-        })();
+        }).then(() => {
+          void tryAddPending();
+        });
         break;
       }
       case "message": {
-        void (async () => {
+        void enqueueMls(async () => {
           const session = mlsRef.current;
           if (!session?.state) {
             setError("Received message but MLS group not ready");
@@ -451,7 +478,7 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
           } catch {
             setError("Failed to decrypt MLS message");
           }
-        })();
+        });
         break;
       }
       case "typing":
@@ -628,13 +655,12 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
       const trimmed = text.trim();
       if (!trimmed) return false;
       const ws = wsRef.current;
-      const session = mlsRef.current;
 
       if (!ws || ws.readyState !== WebSocket.OPEN) {
         setError("Not connected — wait a moment or refresh");
         return false;
       }
-      if (!session?.state) {
+      if (!mlsRef.current?.state) {
         setError("Encryption not ready — waiting for MLS group");
         return false;
       }
@@ -644,46 +670,54 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
       }
 
       try {
-        const messageId = generateMessageId();
-        const mode = ttlModeRef.current;
-        const enc = await encryptApp(session, trimmed);
-        persistMls(enc.session);
-        ws.send(
-          JSON.stringify({
-            v: PROTOCOL_VERSION,
-            type: "message",
-            ciphertext: enc.ciphertextB64,
-            nonce: MLS_NONCE_MARKER,
-            ttlMode: mode,
-            messageId,
-          })
-        );
+        return await enqueueMls(async () => {
+          const session = mlsRef.current;
+          if (!session?.state || !wsRef.current) return false;
+          const messageId = generateMessageId();
+          const mode = ttlModeRef.current;
+          const enc = await encryptApp(session, trimmed);
+          persistMls(enc.session);
+          wsRef.current.send(
+            JSON.stringify({
+              v: PROTOCOL_VERSION,
+              type: "message",
+              ciphertext: enc.ciphertextB64,
+              nonce: MLS_NONCE_MARKER,
+              ttlMode: mode,
+              messageId,
+            })
+          );
 
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: messageId,
-            from: myIdRef.current ?? "You",
-            text: trimmed,
-            mine: true,
-            ttlMode: mode,
-            receivedAt: Date.now(),
-          },
-        ]);
-        scheduleTtl(messageId, mode, true);
-        setMeTyping(false);
-        lastTypingSent.current = false;
-        ws.send(
-          JSON.stringify({ v: PROTOCOL_VERSION, type: "typing", state: false })
-        );
-        setError(null);
-        return true;
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: messageId,
+              from: myIdRef.current ?? "You",
+              text: trimmed,
+              mine: true,
+              ttlMode: mode,
+              receivedAt: Date.now(),
+            },
+          ]);
+          scheduleTtl(messageId, mode, true);
+          setMeTyping(false);
+          lastTypingSent.current = false;
+          wsRef.current.send(
+            JSON.stringify({
+              v: PROTOCOL_VERSION,
+              type: "typing",
+              state: false,
+            })
+          );
+          setError(null);
+          return true;
+        });
       } catch (e) {
         setError(e instanceof Error ? e.message : "Failed to send");
         return false;
       }
     },
-    [scheduleTtl, persistMls]
+    [scheduleTtl, persistMls, enqueueMls]
   );
 
   const notifyTyping = useCallback((isTyping: boolean) => {

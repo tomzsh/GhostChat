@@ -164,6 +164,21 @@ describe("wire encoding", () => {
 });
 
 describe("MLS group (RFC 9420)", () => {
+  it("2-party message round-trip", async () => {
+    const room = "MLS2P1";
+    let alice = await createMlsSession("alice", room);
+    let bob = await createMlsSession("bob", room);
+    alice = await bootstrapGroup(alice);
+    const add = await addMember(alice, exportKeyPackage(bob));
+    alice = add.session;
+    bob = await acceptWelcome(bob, add.welcomeB64);
+    assert.equal(epochSafetyNumber(alice), epochSafetyNumber(bob));
+    const enc = await encryptApp(bob, "from bob");
+    bob = enc.session;
+    const dec = await decryptApp(alice, enc.ciphertextB64);
+    assert.equal(dec.text, "from bob");
+  });
+
   it("3-party join, message, and remove", async () => {
     const room = "MLS001";
     let alice = await createMlsSession("alice", room);
