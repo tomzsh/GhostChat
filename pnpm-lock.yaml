@@ -11,7 +11,11 @@ overrides:
 
 importers:
 
-  .: {}
+  .:
+    dependencies:
+      next:
+        specifier: 15.5.20
+        version: 15.5.20(react-dom@19.2.7(react@19.2.7))(react@19.2.7)
 
   apps/cli:
     dependencies:

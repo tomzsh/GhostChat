@@ -10,6 +10,9 @@
   },
   "engines": { "node": ">=20" },
   "packageManager": "pnpm@10.8.0",
+  "dependencies": {
+    "next": "15.5.20"
+  },
   "pnpm": {
     "overrides": {
       "next": "15.5.20",
