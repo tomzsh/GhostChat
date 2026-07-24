@@ -182,11 +182,12 @@ export type RoomStatusResponse =
       status: "ok";
       /** Public invite code (may differ from internal DO id after rotation). */
       roomId: string;
-      /** Stable Durable Object / WS id — clients keep this for the socket. */
-      internalId?: string;
-      participantCount: number;
       maxParticipants: number;
       full: boolean;
+      /** Not returned on public invite probes */
+      internalId?: string;
+      /** Not returned on public invite probes */
+      participantCount?: number;
     }
   | { status: "not_found" }
   | { status: "full"; roomId: string; maxParticipants?: number };
@@ -197,8 +198,15 @@ export type CreateRoomRequest = {
 
 export type CreateRoomResponse = {
   roomId: string;
-  wsUrl: string;
   maxParticipants: number;
+  /**
+   * Path-only WebSocket target (e.g. `/ws/ABC123`).
+   * Clients prefix with their own WS origin — do not rely on full hostnames
+   * from the API (avoids leaking infrastructure details).
+   */
+  wsPath: string;
+  /** @deprecated Prefer wsPath + client-configured origin */
+  wsUrl?: string;
 };
 
 function isNonEmptyString(v: unknown, max: number): v is string {

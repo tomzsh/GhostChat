@@ -247,8 +247,8 @@ pnpm --filter @ghostchat/cli start join AB92KF
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/rooms` | Create room → `{ roomId, wsUrl, maxParticipants }` |
-| `GET` | `/api/rooms/:id` | Status: `ok` / `not_found` / full flag (+ `publicCode` / `internalId`) |
+| `POST` | `/api/rooms` | Create room → `{ roomId, maxParticipants, wsPath }` |
+| `GET` | `/api/rooms/:id` | Public probe: `ok` / `not_found` / `full` (no `internalId`) |
 | `GET` | `/api/health` or `/health` | Liveness `{ ok: true, service: "ghostchat-worker" }` |
 
 ### WebSocket
@@ -266,8 +266,8 @@ pnpm --filter @ghostchat/cli start join AB92KF
 | Max image (compressed) | 1 MB |
 | Image chunk size | ~24 KB (paced send) |
 | Max ciphertext (wire) | ~2.5 MB |
-| Create rooms / IP / minute | 10 |
-| Join probes (GET + WS) / IP / minute | 30 |
+| Create rooms / IP / minute | 5 |
+| Join probes (GET + WS) / IP / minute | 20 |
 | Idle timeout | 10 minutes |
 | Max room age | 24 hours |
 | Empty-room grace | 30 seconds |
@@ -366,7 +366,8 @@ Application plaintext may be plain text, or structured payloads (`GCIMG1` / `GCI
 | Binding / var | Purpose |
 |---|---|
 | `ROOMS` | Durable Object namespace |
-| `PUBLIC_WS_ORIGIN` | `wsUrl` returned by create (e.g. `wss://….workers.dev`) |
+| `PUBLIC_WS_ORIGIN` | Optional docs origin (create returns path-only `wsPath`) |
+| `ALLOWED_ORIGINS` | Comma-separated browser CORS origins (empty = built-in list) |
 
 Local dev binds `0.0.0.0:8787`.
 
@@ -429,23 +430,38 @@ Manual E2E ideas:
 
 ```bash
 cd apps/worker
-# set PUBLIC_WS_ORIGIN=wss://your-worker.subdomain.workers.dev
+# Optional: public docs origin; create API returns path-only `wsPath`
 pnpm deploy
-# or: wrangler deploy --name <worker> --var PUBLIC_WS_ORIGIN:wss://…
+# Production example:
+# wrangler deploy --name ghostchat-app \
+#   --var PUBLIC_WS_ORIGIN:wss://relay.example.com \
+#   --var ALLOWED_ORIGINS:https://app.example.com,http://127.0.0.1:3000
 ```
 
 Requires a Workers plan that supports **Durable Objects**.
+
+**Hide `*.workers.dev`:** attach a **Custom Domain** on the Worker (e.g. `relay.example.com`), then point web env at that host. Clients never need the raw workers.dev name.
 
 ### Web (e.g. Vercel)
 
 1. Root of the monorepo as the project directory  
 2. Build: `pnpm build`  
 3. Env:
-   - `NEXT_PUBLIC_WS_URL=wss://your-worker…`
-   - `WORKER_URL=https://your-worker…` (for `/api/*` rewrites)
-   - optionally `NEXT_PUBLIC_API_URL=https://your-worker…`
+   - `NEXT_PUBLIC_WS_URL=wss://relay.example.com` (or your worker host)
+   - `WORKER_URL=https://relay.example.com` (for `/api/*` rewrites)
+   - optionally `NEXT_PUBLIC_API_URL=https://…`
 
-Health probe uses same-origin `/api/health` → rewrite → worker `/api/health` (also accepts `/health`).
+Health probe uses same-origin `/api/health` → rewrite → worker.  
+Create room returns `{ roomId, maxParticipants, wsPath }` — the browser builds WS URLs from `NEXT_PUBLIC_WS_URL`.
+
+### Smoke
+
+```bash
+# against defaults (prod) or override:
+SMOKE_API=https://… SMOKE_WEB=https://… bash scripts/smoke.sh
+```
+
+CI runs unit tests on every PR/push; smoke runs on `main` push.
 
 ---
 

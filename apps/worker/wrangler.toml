@@ -19,7 +19,9 @@ tag = "v1"
 new_classes = ["RoomDurableObject"]
 
 [vars]
-# Used only for local `wrangler dev`. Production deploy must pass
-# --var PUBLIC_WS_ORIGIN:wss://<your-worker>.workers.dev
-# (loopback is ignored automatically when the request host is public).
+# Optional docs / operators. Create API returns path-only `wsPath`.
+# Production: set via dashboard or --var to your public relay
+# (custom domain recommended, e.g. wss://relay.example.com).
 PUBLIC_WS_ORIGIN = "ws://127.0.0.1:8787"
+# Comma-separated browser origins for CORS (empty = GhostChat + localhost list)
+# ALLOWED_ORIGINS = "https://ghostchat-web-two.vercel.app,http://127.0.0.1:3000"

@@ -12,6 +12,7 @@ import { canNativeShare, copyText, shareRoomCode } from "@/lib/share";
 import { LIMITS, type AsciiEmojiId } from "@ghostchat/shared";
 import { AnimatedAsciiEmoji } from "./AnimatedAsciiEmoji";
 import { AsciiEmojiPicker } from "./AsciiEmojiPicker";
+import { ReconnectBanner } from "./ReconnectBanner";
 import { CloseRoomModal } from "./CloseRoomModal";
 import {
   PresenceAscii,
@@ -214,6 +215,7 @@ export function RoomChat({ roomId }: { roomId: string }) {
     leaveRoom,
     canSend,
     transferProgress,
+    isReconnecting,
   } = useGhostRoom({ roomId });
 
   const [draft, setDraft] = useState("");
@@ -493,6 +495,7 @@ export function RoomChat({ roomId }: { roomId: string }) {
       }
     >
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        <ReconnectBanner show={isReconnecting} />
         {/* Compact toolbar */}
         <div className="safe-x shrink-0 border-b border-ghost-border/60 px-2.5 py-2 sm:px-4">
           <div className="flex items-center gap-1.5 overflow-x-auto pb-0.5 [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">

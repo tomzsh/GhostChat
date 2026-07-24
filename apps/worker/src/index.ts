@@ -11,26 +11,35 @@ import { SlidingWindowLimiter, clientIp } from "./rateLimit";
 export { RoomDurableObject };
 
 export interface Env extends RoomEnv {
+  /**
+   * Optional documented public WS origin for operators.
+   * Create API returns path-only `wsPath` — clients use their own WS config.
+   */
   PUBLIC_WS_ORIGIN: string;
+  /**
+   * Comma-separated browser origins allowed for CORS.
+   * Example: https://ghostchat-web-two.vercel.app,http://127.0.0.1:3000
+   * Empty → built-in GhostChat hosts + localhost (not `*`).
+   */
+  ALLOWED_ORIGINS?: string;
 }
 
-const CORS_HEADERS: Record<string, string> = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-};
-
-/** Baseline security headers for Worker JSON / OPTIONS responses. */
 const SECURITY_HEADERS: Record<string, string> = {
   "X-Content-Type-Options": "nosniff",
   "X-Frame-Options": "DENY",
   "Referrer-Policy": "no-referrer",
   "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=()",
   "Cross-Origin-Resource-Policy": "cross-origin",
-  // Workers are always HTTPS on *.workers.dev
   "Strict-Transport-Security":
     "max-age=63072000; includeSubDomains; preload",
 };
+
+const DEFAULT_ALLOWED_ORIGINS = [
+  "https://ghostchat-web-two.vercel.app",
+  "https://ghostchat-web-tomzsh1.vercel.app",
+  "http://127.0.0.1:3000",
+  "http://localhost:3000",
+];
 
 const createLimiter = new SlidingWindowLimiter(
   LIMITS.maxCreatesPerMinute,
@@ -41,37 +50,78 @@ const joinLimiter = new SlidingWindowLimiter(
   LIMITS.rateLimitWindowMs
 );
 
-function json(data: unknown, status = 200): Response {
+function allowedOriginList(env: Env): string[] {
+  const raw = env.ALLOWED_ORIGINS?.trim();
+  if (!raw) return DEFAULT_ALLOWED_ORIGINS;
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function isOriginAllowed(origin: string, env: Env): boolean {
+  const list = allowedOriginList(env);
+  if (list.includes("*")) return true;
+  if (list.includes(origin)) return true;
+  try {
+    const u = new URL(origin);
+    // Preview: https://ghostchat-*.vercel.app
+    if (
+      u.protocol === "https:" &&
+      u.hostname.endsWith(".vercel.app") &&
+      u.hostname.includes("ghostchat")
+    ) {
+      return true;
+    }
+  } catch {
+    /* ignore */
+  }
+  return false;
+}
+
+function corsHeaders(request: Request, env: Env): Record<string, string> {
+  const origin = request.headers.get("Origin");
+  const base: Record<string, string> = {
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Max-Age": "86400",
+  };
+  // CLI / server-to-server: no Origin
+  if (!origin) return base;
+  if (isOriginAllowed(origin, env)) {
+    return {
+      ...base,
+      "Access-Control-Allow-Origin": origin,
+      Vary: "Origin",
+    };
+  }
+  return base;
+}
+
+function json(
+  data: unknown,
+  status: number,
+  request: Request,
+  env: Env
+): Response {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
       "Cache-Control": "no-store",
       ...SECURITY_HEADERS,
-      ...CORS_HEADERS,
+      ...corsHeaders(request, env),
     },
   });
 }
 
-function rateLimited(): Response {
-  return json({ error: "rate_limited", code: "rate_limited" }, 429);
-}
-
-/** Prefer env PUBLIC_WS_ORIGIN, but ignore localhost/127.0.0.1 on public hosts. */
-function resolvePublicWsOrigin(request: Request, env: Env): string {
-  const url = new URL(request.url);
-  const fromRequest = `${url.protocol === "https:" ? "wss" : "ws"}://${url.host}`;
-  const configured = (env.PUBLIC_WS_ORIGIN || "").replace(/\/$/, "").trim();
-  if (!configured) return fromRequest;
-  // Deployed worker with leftover local wrangler var — use request host instead
-  if (/127\.0\.0\.1|localhost/i.test(configured) && url.hostname !== "127.0.0.1") {
-    return fromRequest;
-  }
-  // Force wss when client hit us over https
-  if (url.protocol === "https:" && configured.startsWith("ws://")) {
-    return configured.replace(/^ws:\/\//i, "wss://");
-  }
-  return configured;
+function rateLimited(request: Request, env: Env): Response {
+  return json(
+    { error: "rate_limited", code: "rate_limited" },
+    429,
+    request,
+    env
+  );
 }
 
 function getRoomStub(env: Env, roomId: string): DurableObjectStub {
@@ -91,7 +141,36 @@ type StatusBody =
   | { status: "not_found" }
   | { status: "full"; roomId: string; maxParticipants?: number };
 
-/** Prefixed alias DO name (must match room.ts). */
+/** Public invite probe — no internalId / live count leakage. */
+type PublicStatusBody =
+  | {
+      status: "ok";
+      roomId: string;
+      maxParticipants: number;
+      full: boolean;
+    }
+  | { status: "not_found" }
+  | { status: "full"; roomId: string; maxParticipants?: number };
+
+function toPublicStatus(body: StatusBody): PublicStatusBody {
+  if (body.status === "ok") {
+    return {
+      status: "ok",
+      roomId: body.roomId,
+      maxParticipants: body.maxParticipants,
+      full: body.full,
+    };
+  }
+  if (body.status === "full") {
+    return {
+      status: "full",
+      roomId: body.roomId,
+      maxParticipants: body.maxParticipants,
+    };
+  }
+  return { status: "not_found" };
+}
+
 function aliasDoName(publicCode: string): string {
   return `a:${publicCode}`;
 }
@@ -116,18 +195,11 @@ async function followAlias(
   };
 }
 
-/**
- * Resolve invite / internal code → live room.
- * - Prefixed aliases `a:CODE` (current) + legacy unprefixed alias DOs
- * - `invite`: after rotation, bare internal id is NOT a valid share code
- * - `ws`: allow internal id so existing sockets/reconnects keep working
- */
 async function resolveRoom(
   env: Env,
   code: string,
   mode: "invite" | "ws"
 ): Promise<{ body: StatusBody; status: number; internalId: string | null }> {
-  // 1) Prefixed invite alias (post-rotation codes)
   try {
     const pref = await getRoomStub(env, aliasDoName(code)).fetch(
       "https://do/status"
@@ -140,7 +212,6 @@ async function resolveRoom(
     /* fall through */
   }
 
-  // 2) Direct DO name (live room or legacy unprefixed alias)
   const first = await getRoomStub(env, code).fetch("https://do/status");
   const body = (await first.json()) as StatusBody;
 
@@ -155,7 +226,6 @@ async function resolveRoom(
   if (body.status === "ok") {
     const internalId = body.internalId ?? code;
     const publicCode = body.roomId;
-    // Stale internal-as-invite after rotation (share/QR must use publicCode)
     if (
       mode === "invite" &&
       code === internalId &&
@@ -163,7 +233,6 @@ async function resolveRoom(
     ) {
       return { body: { status: "not_found" }, status: 404, internalId: null };
     }
-    // Unknown code that somehow hit a room DO
     if (code !== publicCode && code !== internalId) {
       return { body: { status: "not_found" }, status: 404, internalId: null };
     }
@@ -182,7 +251,7 @@ export default {
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
-        headers: { ...SECURITY_HEADERS, ...CORS_HEADERS },
+        headers: { ...SECURITY_HEADERS, ...corsHeaders(request, env) },
       });
     }
 
@@ -191,7 +260,9 @@ export default {
     const ip = clientIp(request);
 
     if (path === "/api/rooms" && request.method === "POST") {
-      if (!createLimiter.allow(`create:${ip}`)) return rateLimited();
+      if (!createLimiter.allow(`create:${ip}`)) {
+        return rateLimited(request, env);
+      }
 
       let maxParticipants: number = LIMITS.defaultMaxParticipants;
       try {
@@ -211,26 +282,31 @@ export default {
         body: JSON.stringify({ roomId, maxParticipants }),
       });
 
-      // Never advertise loopback in production (wrangler.toml often has local default)
-      const wsOrigin = resolvePublicWsOrigin(request, env);
-
-      return json({
-        roomId,
-        wsUrl: `${wsOrigin}/ws/${roomId}`,
-        maxParticipants,
-      });
+      // Path only — clients prefix with their configured WS origin (no infra leak)
+      return json(
+        {
+          roomId,
+          maxParticipants,
+          wsPath: `/ws/${roomId}`,
+        },
+        200,
+        request,
+        env
+      );
     }
 
     const statusMatch = path.match(/^\/api\/rooms\/([A-Za-z0-9]+)$/);
     if (statusMatch && request.method === "GET") {
-      if (!joinLimiter.allow(`join:${ip}`)) return rateLimited();
+      if (!joinLimiter.allow(`join:${ip}`)) {
+        return rateLimited(request, env);
+      }
 
       const roomId = normalizeRoomId(statusMatch[1]!);
       if (!isValidRoomId(roomId)) {
-        return json({ status: "not_found" }, 404);
+        return json({ status: "not_found" }, 404, request, env);
       }
       const { body, status } = await resolveRoom(env, roomId, "invite");
-      return json(body, status);
+      return json(toPublicStatus(body), status, request, env);
     }
 
     const wsMatch = path.match(/^\/ws\/([A-Za-z0-9]+)$/);
@@ -242,20 +318,19 @@ export default {
             "Content-Type": "application/json; charset=utf-8",
             "Cache-Control": "no-store",
             ...SECURITY_HEADERS,
-            ...CORS_HEADERS,
+            ...corsHeaders(request, env),
           },
         });
       }
 
       const roomId = normalizeRoomId(wsMatch[1]!);
       if (!isValidRoomId(roomId)) {
-        return json({ error: "room_not_found" }, 404);
+        return json({ error: "room_not_found" }, 404, request, env);
       }
 
-      // Resolve alias / rotated codes to stable internal DO (allow internal id)
       const resolved = await resolveRoom(env, roomId, "ws");
       if (!resolved.internalId || resolved.body.status === "not_found") {
-        return json({ error: "room_not_found" }, 404);
+        return json({ error: "room_not_found" }, 404, request, env);
       }
 
       const stub = getRoomStub(env, resolved.internalId);
@@ -264,14 +339,18 @@ export default {
       return stub.fetch(doUrl.toString(), request);
     }
 
-    // Both paths: Next rewrites historically used /health; clients may call /api/health
     if (
       (path === "/api/health" || path === "/health") &&
       request.method === "GET"
     ) {
-      return json({ ok: true, service: "ghostchat-worker" });
+      return json(
+        { ok: true, service: "ghostchat-worker" },
+        200,
+        request,
+        env
+      );
     }
 
-    return json({ error: "not_found" }, 404);
+    return json({ error: "not_found" }, 404, request, env);
   },
 };

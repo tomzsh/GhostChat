@@ -177,6 +177,8 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
   const [transferProgress, setTransferProgress] = useState<string | null>(
     null
   );
+  /** True after first successful join — used for reconnect banner. */
+  const [hadSession, setHadSession] = useState(false);
 
   // Keep refs in sync — roomIdRef stays on join key (not rotated public code)
   roomIdRef.current = joinIdRef.current;
@@ -617,6 +619,7 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
         else rememberWsInternal(prevKey, joinIdRef.current);
 
         const sid = joinIdRef.current;
+        setHadSession(true);
         // Keep MLS bootstrap on the same queue as commits/encrypt
         void enqueueMls(async () => {
           setMyId(msg.yourId);
@@ -1407,11 +1410,18 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
   const displayState: RoomConnectionState =
     canSendUi && state === "waiting_peer" ? "ready" : state;
 
+  /** Socket dropped after we were in a session — UI can show reconnect strip */
+  const isReconnecting =
+    hadSession &&
+    state === "connecting" &&
+    !intentionalClose.current;
+
   const peerId =
     typingPeers[0] ?? (members.length === 1 ? members[0]!.id : null);
 
   return {
     state: displayState,
+    isReconnecting,
     myId,
     peerId,
     /** Current shareable invite code (may rotate after someone leaves). */

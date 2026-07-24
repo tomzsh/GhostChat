@@ -77,8 +77,10 @@ export const LIMITS = {
   idleTimeoutMs: 10 * 60 * 1000,
   maxAgeMs: 24 * 60 * 60 * 1000,
   reconnectGraceMs: 30 * 1000,
-  maxCreatesPerMinute: 10,
-  maxJoinProbesPerMinute: 30,
+  /** Room creates per IP per minute (Worker sliding window). */
+  maxCreatesPerMinute: 5,
+  /** Status GET + WS join probes per IP per minute. */
+  maxJoinProbesPerMinute: 20,
   rateLimitWindowMs: 60_000,
 } as const;
 

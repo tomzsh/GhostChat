@@ -247,8 +247,8 @@ pnpm --filter @ghostchat/cli start join AB92KF
 
 | Metode | Path | Deskripsi |
 |---|---|---|
-| `POST` | `/api/rooms` | Buat room → `{ roomId, wsUrl, maxParticipants }` |
-| `GET` | `/api/rooms/:id` | Status: `ok` / `not_found` / full (+ `publicCode` / `internalId`) |
+| `POST` | `/api/rooms` | Buat room → `{ roomId, maxParticipants, wsPath }` |
+| `GET` | `/api/rooms/:id` | Probe publik: `ok` / `not_found` / `full` (tanpa `internalId`) |
 | `GET` | `/api/health` atau `/health` | Hidup `{ ok: true, service: "ghostchat-worker" }` |
 
 ### WebSocket
@@ -377,7 +377,8 @@ Berapa lama pesan tampil di UI sebelum dihapus. Kontrak **antar client** — ser
 | Binding / var | Fungsi |
 |---|---|
 | `ROOMS` | Namespace Durable Object |
-| `PUBLIC_WS_ORIGIN` | `wsUrl` hasil create (mis. `wss://….workers.dev`) |
+| `PUBLIC_WS_ORIGIN` | Origin opsional (create mengembalikan `wsPath` saja) |
+| `ALLOWED_ORIGINS` | Daftar origin CORS (kosong = daftar bawaan) |
 
 Dev lokal listen di `0.0.0.0:8787`.
 

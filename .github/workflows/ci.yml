@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: typecheck + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.8.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build packages
+        run: pnpm build:packages
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Unit tests
+        run: pnpm test
+
+  smoke:
+    name: smoke (prod health)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Optional: only on main push so PRs don't hit prod rate limits hard
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Smoke probe
+        env:
+          # Override with repo Variables SMOKE_API_URL / SMOKE_WEB_URL if set
+          SMOKE_API: ${{ vars.SMOKE_API_URL }}
+          SMOKE_WEB: ${{ vars.SMOKE_WEB_URL }}
+        run: |
+          export SMOKE_API="${SMOKE_API:-https://ghostchat-app.gustom81.workers.dev}"
+          export SMOKE_WEB="${SMOKE_WEB:-https://ghostchat-web-two.vercel.app}"
+          bash scripts/smoke.sh
