@@ -74,6 +74,19 @@ describe("app image payload", () => {
   });
 });
 
+describe("app emoji payload", () => {
+  it("round-trips emoji encode/decode", async () => {
+    const { encodeAppEmoji, decodeAppPayload, isAsciiEmojiId } = await import(
+      "./index.ts"
+    );
+    assert.ok(isAsciiEmojiId("wave"));
+    const wire = encodeAppEmoji("wave");
+    const parsed = decodeAppPayload(wire);
+    assert.equal(parsed.kind, "emoji");
+    if (parsed.kind === "emoji") assert.equal(parsed.id, "wave");
+  });
+});
+
 describe("max participants", () => {
   it("clamps into allowed range", () => {
     assert.equal(clampMaxParticipants(2), 2);

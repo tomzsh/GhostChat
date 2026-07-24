@@ -2,6 +2,12 @@
 
 All notable changes to GhostChat are documented in this file.
 
+## [2.5.0] — 2026-07-24
+
+### Added
+- **Animated ASCII emoji**: picker + looping multi-frame emotes sent as tiny
+  E2EE app payloads (`wave`, `heart`, `ghost`, …)
+
 ## [2.4.0] — 2026-07-24
 
 ### Added

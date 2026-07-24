@@ -153,6 +153,12 @@ body {
   max-width: 100%;
 }
 
+/* Animated ASCII emote in chat */
+.ascii-emoji {
+  text-shadow: 0 0 6px rgba(51, 255, 102, 0.2);
+  margin: 0;
+}
+
 /* Peer join / leave banner */
 .presence-ascii {
   transition:

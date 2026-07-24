@@ -9,6 +9,9 @@ import {
   type RoomConnectionState,
 } from "@/hooks/useGhostRoom";
 import { canNativeShare, copyText, shareRoomCode } from "@/lib/share";
+import type { AsciiEmojiId } from "@ghostchat/shared";
+import { AnimatedAsciiEmoji } from "./AnimatedAsciiEmoji";
+import { AsciiEmojiPicker } from "./AsciiEmojiPicker";
 import { CloseRoomModal } from "./CloseRoomModal";
 import {
   PresenceAscii,
@@ -97,6 +100,7 @@ function statusLine(
 
 const MessageRow = memo(function MessageRow({ m }: { m: ChatMessage }) {
   const isImage = m.kind === "image" && m.imageUrl;
+  const isEmoji = m.kind === "emoji" && m.emojiId;
   return (
     <div
       className={`rounded px-2 py-1.5 ${
@@ -106,7 +110,7 @@ const MessageRow = memo(function MessageRow({ m }: { m: ChatMessage }) {
       <div className="mb-0.5 flex items-baseline justify-between gap-2">
         <span className="text-[10px] text-ghost-dim sm:text-[11px]">
           {m.mine ? "you" : m.from}
-          {isImage ? " · img" : ""}
+          {isImage ? " · img" : isEmoji ? " · ascii" : ""}
         </span>
         <span className="shrink-0 text-[9px] text-ghost-dim/50">
           burn:{ttlShort(m.ttlMode)}
@@ -132,6 +136,10 @@ const MessageRow = memo(function MessageRow({ m }: { m: ChatMessage }) {
             </span>
           ) : null}
         </a>
+      ) : isEmoji ? (
+        <div className="py-1">
+          <AnimatedAsciiEmoji id={m.emojiId!} />
+        </div>
       ) : (
         <p
           className={`break-words text-[13px] leading-snug sm:text-sm ${
@@ -166,6 +174,7 @@ export function RoomChat({ roomId }: { roomId: string }) {
     safetyNumber,
     sendMessage,
     sendImage,
+    sendEmoji,
     notifyTyping,
     leaveRoom,
     canSend,
@@ -178,6 +187,7 @@ export function RoomChat({ roomId }: { roomId: string }) {
   const [supportsShare, setSupportsShare] = useState(false);
   const [showQr, setShowQr] = useState(true);
   const [sendingImage, setSendingImage] = useState(false);
+  const [emojiOpen, setEmojiOpen] = useState(false);
   const [presenceEvent, setPresenceEvent] = useState<PresenceEvent | null>(
     null
   );
@@ -368,6 +378,17 @@ export function RoomChat({ roomId }: { roomId: string }) {
       }
     },
     [canSend, sendImage, flash]
+  );
+
+  const onPickEmoji = useCallback(
+    async (id: AsciiEmojiId) => {
+      if (!canSend) return;
+      setEmojiOpen(false);
+      const ok = await sendEmoji(id);
+      if (ok) flash("ok", `:${id}:`);
+      else flash("err", "Emoji failed");
+    },
+    [canSend, sendEmoji, flash]
   );
 
   return (
@@ -579,6 +600,12 @@ export function RoomChat({ roomId }: { roomId: string }) {
           >
             {ttlHint}
           </p>
+          <AsciiEmojiPicker
+            open={emojiOpen}
+            disabled={!canSend}
+            onPick={onPickEmoji}
+            onClose={() => setEmojiOpen(false)}
+          />
           <div className="flex items-stretch gap-2">
             <input
               ref={fileInputRef}
@@ -588,6 +615,19 @@ export function RoomChat({ roomId }: { roomId: string }) {
               className="hidden"
               onChange={onImageSelected}
             />
+            <button
+              type="button"
+              onClick={() => setEmojiOpen((v) => !v)}
+              disabled={!canSend}
+              className={`chip !min-h-11 shrink-0 touch-manipulation px-2.5 text-[12px] disabled:opacity-40 ${
+                emojiOpen ? "chip--active" : ""
+              }`}
+              aria-label="ASCII emoji"
+              aria-expanded={emojiOpen}
+              title="Animated ASCII emoji"
+            >
+              : )
+            </button>
             <button
               type="button"
               onClick={onPickImage}

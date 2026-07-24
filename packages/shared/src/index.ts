@@ -121,8 +121,31 @@ export function isValidTtlMode(mode: string): mode is TtlMode {
 
 // --- Ephemeral image payloads (inside MLS app messages) ---
 
-/** Magic prefix so receivers can distinguish text vs image app payloads. */
+/** Magic prefixes for structured MLS application payloads. */
 export const APP_IMAGE_PREFIX = "\u0001GCIMG1:" as const;
+export const APP_EMOJI_PREFIX = "\u0001GCEMO1:" as const;
+
+/** Built-in animated ASCII emote ids (frames live on clients). */
+export const ASCII_EMOJI_IDS = [
+  "wave",
+  "heart",
+  "fire",
+  "ghost",
+  "lol",
+  "thumbsup",
+  "party",
+  "skull",
+  "coffee",
+  "cry",
+  "cool",
+  "think",
+] as const;
+
+export type AsciiEmojiId = (typeof ASCII_EMOJI_IDS)[number];
+
+export function isAsciiEmojiId(id: string): id is AsciiEmojiId {
+  return (ASCII_EMOJI_IDS as readonly string[]).includes(id);
+}
 
 export type DecodedAppPayload =
   | { kind: "text"; text: string }
@@ -131,7 +154,8 @@ export type DecodedAppPayload =
       mime: string;
       name: string;
       bytes: Uint8Array;
-    };
+    }
+  | { kind: "emoji"; id: AsciiEmojiId };
 
 function b64Encode(bytes: Uint8Array): string {
   let binary = "";
@@ -172,8 +196,28 @@ export function encodeAppImage(
   );
 }
 
-/** Parse MLS application plaintext into text or image. */
+/** Pack an animated ASCII emote id into an MLS application plaintext. */
+export function encodeAppEmoji(id: AsciiEmojiId | string): string {
+  if (!isAsciiEmojiId(id)) throw new Error("Unknown ASCII emoji");
+  return APP_EMOJI_PREFIX + JSON.stringify({ id });
+}
+
+/** Parse MLS application plaintext into text, image, or emoji. */
 export function decodeAppPayload(text: string): DecodedAppPayload {
+  if (text.startsWith(APP_EMOJI_PREFIX)) {
+    try {
+      const raw = JSON.parse(text.slice(APP_EMOJI_PREFIX.length)) as {
+        id?: string;
+      };
+      if (typeof raw.id === "string" && isAsciiEmojiId(raw.id)) {
+        return { kind: "emoji", id: raw.id };
+      }
+      return { kind: "text", text: "[unknown emoji]" };
+    } catch {
+      return { kind: "text", text: "[invalid emoji]" };
+    }
+  }
+
   if (!text.startsWith(APP_IMAGE_PREFIX)) {
     return { kind: "text", text };
   }

@@ -25,10 +25,12 @@ import {
 } from "@ghostchat/protocol";
 import {
   decodeAppPayload,
+  encodeAppEmoji,
   encodeAppImage,
   generateMessageId,
   isOnLeaveTtl,
   parseTtlMs,
+  type AsciiEmojiId,
   type TtlMode,
 } from "@ghostchat/shared";
 import { getWsUrl } from "@/lib/config";
@@ -52,11 +54,13 @@ export type ChatMessage = {
   ttlMode: TtlMode;
   receivedAt: number;
   burning?: boolean;
-  kind?: "text" | "image";
+  kind?: "text" | "image" | "emoji";
   /** Object URL for decrypted/local image (revoke on burn). */
   imageUrl?: string;
   imageName?: string;
   imageMime?: string;
+  /** Animated ASCII emote id */
+  emojiId?: string;
 };
 
 export type RoomMember = {
@@ -418,6 +422,17 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
           imageUrl,
           imageName: parsed.name,
           imageMime: parsed.mime,
+        };
+      } else if (parsed.kind === "emoji") {
+        msg = {
+          id: meta.id,
+          from: meta.from,
+          text: `:${parsed.id}:`,
+          mine: meta.mine,
+          ttlMode: meta.ttlMode,
+          receivedAt: Date.now(),
+          kind: "emoji",
+          emojiId: parsed.id,
         };
       } else {
         msg = {
@@ -917,6 +932,20 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     [sendAppPayload]
   );
 
+  /** Send an animated ASCII emote by id. */
+  const sendEmoji = useCallback(
+    async (id: AsciiEmojiId | string) => {
+      try {
+        const payload = encodeAppEmoji(id);
+        return await sendAppPayload(payload);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Failed to send emoji");
+        return false;
+      }
+    },
+    [sendAppPayload]
+  );
+
   const notifyTyping = useCallback((isTyping: boolean) => {
     const sendTyping = (s: boolean) => {
       if (wsRef.current?.readyState !== WebSocket.OPEN) return;
@@ -1010,6 +1039,7 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     safetyNumber,
     sendMessage,
     sendImage,
+    sendEmoji,
     notifyTyping,
     leaveRoom,
     canSend: canSendUi,
