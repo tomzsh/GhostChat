@@ -281,6 +281,22 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     }
   }, []);
 
+  /**
+   * Burn every message in the local transcript (animation + clear timers).
+   * Used when a peer leaves — no durable chat trail after departure.
+   * Each remaining client does this on `peer_left` (no server message store).
+   */
+  const burnAllMessages = useCallback(() => {
+    clearBurnTimers();
+    setMessages((prev) => {
+      if (prev.length === 0) return prev;
+      return prev.map((m) => ({ ...m, burning: true }));
+    });
+    setTimeout(() => {
+      setMessages([]);
+    }, 450);
+  }, [clearBurnTimers]);
+
   const scheduleTtl = useCallback(
     (messageId: string, mode: TtlMode, mine: boolean) => {
       const ms = parseTtlMs(mode);
@@ -383,6 +399,9 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
         setParticipantCount(msg.participantCount ?? 0);
         setTypingPeers((prev) => prev.filter((id) => id !== leftId));
         pendingKp.current.delete(leftId);
+
+        // Privacy: burn entire local transcript when anyone leaves
+        burnAllMessages();
 
         void enqueueMls(async () => {
           const session = mlsRef.current;
@@ -533,6 +552,7 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
         break;
       }
       case "room_closed": {
+        burnAllMessages();
         setState("closed");
         setError(`Room closed: ${msg.reason}`);
         clearRoomSession(rid);
@@ -777,6 +797,8 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
       clearTimeout(reconnectTimer.current);
       reconnectTimer.current = null;
     }
+    // Local burn before teardown (peers burn on their peer_left)
+    burnAllMessages();
     clearBurnTimers();
     clearKpRetries();
     if (typingTimer.current) clearTimeout(typingTimer.current);
@@ -797,7 +819,7 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     setSafetyNumber(null);
     setError(null);
     setState("closed");
-  }, [clearBurnTimers, clearKpRetries]);
+  }, [burnAllMessages, clearBurnTimers, clearKpRetries]);
 
   const canSendUi =
     !!safetyNumber &&

@@ -2,6 +2,12 @@
 
 All notable changes to GhostChat are documented in this file.
 
+## [2.1.0] — 2026-07-23
+
+### Added
+- **Burn on leave**: when any peer leaves (or the room closes), the local chat
+  transcript burns on remaining clients; leaving clears your device too
+
 ## [2.0.2] — 2026-07-23
 
 ### Fixed

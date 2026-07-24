@@ -194,6 +194,10 @@ export function Landing() {
               server storage, no accounts.
             </li>
             <li>
+              When someone leaves (or you close the room), the chat transcript
+              burns on every device still open.
+            </li>
+            <li>
               Not protected: compromised devices, sharing the room code with the
               wrong people.
             </li>

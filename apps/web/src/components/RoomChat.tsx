@@ -66,7 +66,9 @@ function statusLine(
     case "connecting":
       return "Connecting…";
     case "waiting_peer":
-      return "Waiting for peer…";
+      return memberCount === 0
+        ? "Waiting for peer… · chat burns on leave"
+        : "Waiting for peer…";
     case "ready": {
       const typing = typingStatus(typingPeers);
       if (typing) return typing;
@@ -74,9 +76,9 @@ function statusLine(
       return `Connected · ${memberCount} peers`;
     }
     case "peer_left":
-      return "Peer left";
+      return "Peer left · messages burned";
     case "closed":
-      return "Room closed";
+      return "Room closed · burned";
     case "error":
       return "Error";
     default:

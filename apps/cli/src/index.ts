@@ -258,6 +258,21 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
     ui.burned(id);
   }
 
+  /** Burn all tracked messages when a peer leaves the room. */
+  function burnAll(reason: string) {
+    const ids = [...burnTimers.keys()];
+    for (const id of ids) {
+      const t = burnTimers.get(id);
+      if (t) clearTimeout(t);
+      burnTimers.delete(id);
+    }
+    if (ids.length > 0) {
+      ui.sys(`messages burned · ${reason} (${ids.length})`);
+    } else {
+      ui.sys(`messages burned · ${reason}`);
+    }
+  }
+
   function scheduleBurn(messageId: string, mode: TtlMode, mine: boolean) {
     const ms = parseTtlMs(mode);
     if (ms === null) {
@@ -338,6 +353,7 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
         pendingKp.delete(msg.peerId);
         participantCount = msg.participantCount ?? members.size + 1;
         ui.warn(`peer left · ${msg.peerId}`);
+        burnAll(`peer left · ${msg.peerId}`);
         if (mls?.state) {
           await enqueueMls(async () => {
             if (
@@ -455,6 +471,7 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
         setPrompt();
         break;
       case "room_closed":
+        burnAll(`room closed · ${msg.reason}`);
         ui.sys(`room closed (${msg.reason})`);
         cleanup(0);
         break;
