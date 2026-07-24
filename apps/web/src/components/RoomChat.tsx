@@ -419,6 +419,8 @@ export function RoomChat({ roomId }: { roomId: string }) {
           )}
         </div>
 
+        <PresenceAscii event={presenceEvent} onDone={onPresenceDone} />
+
         {/* QR — compact, only when open */}
         {showQr ? (
           <div className="shrink-0 border-b border-ghost-border/40 px-2.5 py-2 sm:px-4">
