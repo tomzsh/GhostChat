@@ -650,36 +650,29 @@ export class RoomDurableObject implements DurableObject {
   private async rotatePublicCode() {
     if (!this.env?.ROOMS || this.isAlias || !this.roomId) return;
 
-    let newCode = generateRoomId();
-    for (let i = 0; i < 6; i++) {
-      if (newCode !== this.roomId && newCode !== this.publicCode) break;
-      newCode = generateRoomId();
-    }
-
-    // Register alias DO for the new public code → this room
-    try {
-      const aliasStub = this.env.ROOMS.get(
-        this.env.ROOMS.idFromName(newCode)
-      );
-      const res = await aliasStub.fetch("https://do/init-alias", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ targetRoomId: this.roomId }),
-      });
-      if (!res.ok) {
-        // Collision with an active room — try once more
-        newCode = generateRoomId();
-        const retry = this.env.ROOMS.get(this.env.ROOMS.idFromName(newCode));
-        const res2 = await retry.fetch("https://do/init-alias", {
+    let newCode: string | null = null;
+    // Try several codes — collide with live rooms or busy alias slots
+    for (let i = 0; i < 8; i++) {
+      const candidate = generateRoomId();
+      if (candidate === this.roomId || candidate === this.publicCode) continue;
+      try {
+        const aliasStub = this.env.ROOMS.get(
+          this.env.ROOMS.idFromName(candidate)
+        );
+        const res = await aliasStub.fetch("https://do/init-alias", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ targetRoomId: this.roomId }),
         });
-        if (!res2.ok) return;
+        if (res.ok) {
+          newCode = candidate;
+          break;
+        }
+      } catch {
+        /* try next */
       }
-    } catch {
-      return;
     }
+    if (!newCode) return;
 
     const oldPublic = this.publicCode;
     // Clear previous alias (if it was not the primary DO name)

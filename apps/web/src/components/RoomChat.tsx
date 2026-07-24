@@ -233,12 +233,19 @@ export function RoomChat({ roomId }: { roomId: string }) {
     if (events.length === 0) return;
 
     presenceQueue.current.push(...events);
-    setPresenceEvent((cur) => cur ?? presenceQueue.current.shift() ?? null);
+    // Start banner only if idle (don't shift twice)
+    setPresenceEvent((cur) => {
+      if (cur) return cur;
+      return presenceQueue.current.shift() ?? null;
+    });
   }, [members]);
 
   const onPresenceDone = useCallback(() => {
-    const next = presenceQueue.current.shift() ?? null;
-    setPresenceEvent(next);
+    setPresenceEvent((cur) => {
+      // Drop current; pull next from queue
+      void cur;
+      return presenceQueue.current.shift() ?? null;
+    });
   }, []);
 
   useEffect(() => {
