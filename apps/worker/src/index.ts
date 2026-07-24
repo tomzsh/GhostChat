@@ -57,35 +57,61 @@ type StatusBody =
   | { status: "not_found" }
   | { status: "full"; roomId: string; maxParticipants?: number };
 
+/** Prefixed alias DO name (must match room.ts). */
+function aliasDoName(publicCode: string): string {
+  return `a:${publicCode}`;
+}
+
+async function followAlias(
+  env: Env,
+  target: string
+): Promise<{ body: StatusBody; status: number; internalId: string | null }> {
+  const second = await getRoomStub(env, target).fetch("https://do/status");
+  const inner = (await second.json()) as StatusBody;
+  if (inner.status !== "ok") {
+    return { body: { status: "not_found" }, status: 404, internalId: null };
+  }
+  return {
+    body: {
+      ...inner,
+      roomId: inner.roomId,
+      internalId: inner.internalId ?? target,
+    },
+    status: 200,
+    internalId: inner.internalId ?? target,
+  };
+}
+
 /**
  * Resolve invite / internal code → live room.
- * - `forInvite`: after rotation, internal id alone is NOT a valid share code
- * - `forWs`: allow internal id so existing sockets/reconnects keep working
+ * - Prefixed aliases `a:CODE` (current) + legacy unprefixed alias DOs
+ * - `invite`: after rotation, bare internal id is NOT a valid share code
+ * - `ws`: allow internal id so existing sockets/reconnects keep working
  */
 async function resolveRoom(
   env: Env,
   code: string,
   mode: "invite" | "ws"
 ): Promise<{ body: StatusBody; status: number; internalId: string | null }> {
+  // 1) Prefixed invite alias (post-rotation codes)
+  try {
+    const pref = await getRoomStub(env, aliasDoName(code)).fetch(
+      "https://do/status"
+    );
+    const prefBody = (await pref.json()) as StatusBody;
+    if (prefBody.status === "alias") {
+      return followAlias(env, prefBody.targetRoomId);
+    }
+  } catch {
+    /* fall through */
+  }
+
+  // 2) Direct DO name (live room or legacy unprefixed alias)
   const first = await getRoomStub(env, code).fetch("https://do/status");
   const body = (await first.json()) as StatusBody;
 
   if (body.status === "alias") {
-    const target = body.targetRoomId;
-    const second = await getRoomStub(env, target).fetch("https://do/status");
-    const inner = (await second.json()) as StatusBody;
-    if (inner.status !== "ok") {
-      return { body: { status: "not_found" }, status: 404, internalId: null };
-    }
-    return {
-      body: {
-        ...inner,
-        roomId: inner.roomId,
-        internalId: inner.internalId ?? target,
-      },
-      status: 200,
-      internalId: inner.internalId ?? target,
-    };
+    return followAlias(env, body.targetRoomId);
   }
 
   if (body.status === "not_found") {

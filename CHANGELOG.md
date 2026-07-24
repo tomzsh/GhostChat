@@ -5,10 +5,11 @@ All notable changes to GhostChat are documented in this file.
 ## [2.5.1] — 2026-07-24
 
 ### Fixed
-- **Invite code rotation on leave**: rotate before `peer_left`, include
-  `publicCode` on the leave frame; client locks WS to server `internalId`
-  and maps rotated public codes in sessionStorage so reconnects survive
-  multi-rotation + Next soft-nav
+- **Invite code always rotates when someone leaves** (e.g. 3 → 2 members):
+  explicit client `leave` frame, rotate + notify remaining peers while the
+  socket is still open, prefixed alias DOs (`a:CODE`) so invite aliases never
+  collide with room DOs, last-resort code still pushed to UI even if alias
+  claim is flaky; client locks WS to server `internalId`
 
 ### Changed
 - **Image size**: compressed images up to **1MB** (was ~280KB); wire

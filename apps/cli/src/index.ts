@@ -521,6 +521,13 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
     burnTimers.forEach((t) => clearTimeout(t));
     for (const t of kpRetryTimers) clearTimeout(t);
     try {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ v: PROTOCOL_VERSION, type: "leave" }));
+      }
+    } catch {
+      /* */
+    }
+    try {
       ws.close();
     } catch {
       /* */

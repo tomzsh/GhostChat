@@ -75,6 +75,11 @@ export type ClientMessage =
   | {
       v: typeof PROTOCOL_VERSION;
       type: "ping";
+    }
+  /** Explicit leave — server rotates invite before socket dies. */
+  | {
+      v: typeof PROTOCOL_VERSION;
+      type: "leave";
     };
 
 /** Server → Client */
@@ -270,6 +275,8 @@ export function parseClientMessage(raw: unknown): ClientMessage | null {
       };
     case "ping":
       return { v: PROTOCOL_VERSION, type: "ping" };
+    case "leave":
+      return { v: PROTOCOL_VERSION, type: "leave" };
     default:
       return null;
   }

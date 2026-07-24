@@ -1175,6 +1175,15 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     const rid = roomIdRef.current;
     clearRoomSession(rid);
     clearCachedMlsSession(rid);
+    // Explicit leave so server rotates invite while socket is still open
+    try {
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ v: PROTOCOL_VERSION, type: "leave" }));
+      }
+    } catch {
+      /* ignore */
+    }
     try {
       wsRef.current?.close(1000, "leave");
     } catch {

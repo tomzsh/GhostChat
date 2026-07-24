@@ -41,6 +41,11 @@ type AliasMeta = {
 const ALARM_IDLE = "idle";
 const ALARM_MAX_AGE = "max_age";
 
+/** Prefixed DO name for invite aliases — never collides with room DOs. */
+function aliasDoName(publicCode: string): string {
+  return `a:${publicCode}`;
+}
+
 function isLiveAttachment(a: Attachment | null | undefined): a is Attachment {
   if (!a) return false;
   const t = a.sessionToken;
@@ -303,6 +308,16 @@ export class RoomDurableObject implements DurableObject {
       case "ping":
         this.send(ws, { v: PROTOCOL_VERSION, type: "pong" });
         break;
+      case "leave":
+        // Explicit leave while socket still open — rotate invite reliably
+        if (!attachment) return;
+        await this.handleMemberLeft(ws);
+        try {
+          ws.close(1000, "leave");
+        } catch {
+          /* ignore */
+        }
+        break;
     }
   }
 
@@ -312,7 +327,7 @@ export class RoomDurableObject implements DurableObject {
     _reason: string,
     _wasClean: boolean
   ) {
-    await this.onSocketGone(ws);
+    await this.handleMemberLeft(ws);
   }
 
   async webSocketError(ws: WebSocket, _error: unknown) {
@@ -321,7 +336,7 @@ export class RoomDurableObject implements DurableObject {
     } catch {
       /* ignore */
     }
-    await this.onSocketGone(ws);
+    await this.handleMemberLeft(ws);
   }
 
   async alarm() {
@@ -608,7 +623,11 @@ export class RoomDurableObject implements DurableObject {
     void this.touchActivity();
   }
 
-  private async onSocketGone(ws: WebSocket) {
+  /**
+   * Member left (explicit `leave` frame or socket close).
+   * When others remain, always rotate invite code and push it to every peer.
+   */
+  private async handleMemberLeft(ws: WebSocket) {
     if (this.isAlias) return;
     const att = this.getAttachment(ws);
     if (!att) return;
@@ -636,64 +655,65 @@ export class RoomDurableObject implements DurableObject {
       /* ignore */
     }
 
+    // Count remaining live sessions (leaver already marked __gone)
     const participantCount = this.uniqueSessions().size;
 
-    // Rotate invite BEFORE notifying peers so peer_left can carry the new code
     let newPublic: string | undefined;
     if (participantCount > 0) {
       newPublic = (await this.rotatePublicCode()) ?? undefined;
     }
 
-    this.broadcast(
-      ws,
-      {
-        v: PROTOCOL_VERSION,
-        type: "peer_left",
-        peerId: leftId,
-        participantCount,
-        ...(newPublic ? { publicCode: newPublic } : {}),
-      },
-      true
-    );
-
-    if (newPublic) {
-      this.broadcast(
-        null,
-        {
+    // Send to each remaining peer individually (more reliable than broadcast loops)
+    const leaveMsg: ServerMessage = {
+      v: PROTOCOL_VERSION,
+      type: "peer_left",
+      peerId: leftId,
+      participantCount,
+      ...(newPublic ? { publicCode: newPublic } : {}),
+    };
+    const codeMsg: ServerMessage | null = newPublic
+      ? {
           v: PROTOCOL_VERSION,
           type: "room_code",
           publicCode: newPublic,
-        },
-        false
-      );
+        }
+      : null;
+
+    for (const peer of this.joinedPeers(ws)) {
+      this.send(peer, leaveMsg);
+      if (codeMsg) this.send(peer, codeMsg);
     }
 
     if (participantCount === 0) {
       await this.state.storage.put("emptySince", Date.now());
       await this.state.storage.setAlarm(Date.now() + LIMITS.reconnectGraceMs);
       await this.state.storage.put("alarmKind", "empty");
+    } else {
+      void this.touchActivity();
     }
   }
 
   /**
-   * Invalidate old invite code; register alias DO for the new one.
-   * Returns the new public code, or null if rotation failed.
+   * Always produces a new public invite code for remaining members.
+   * Alias DOs use prefixed names (`a:CODE`) so they never collide with rooms.
    */
   private async rotatePublicCode(): Promise<string | null> {
     if (this.isAlias || !this.roomId) return null;
-    const rooms = this.env?.ROOMS;
-    if (!rooms) {
-      console.error("[ghostchat] rotatePublicCode: ROOMS binding missing");
-      return null;
-    }
 
+    const rooms = this.env?.ROOMS;
     let newCode: string | null = null;
-    // Try several codes — collide with live rooms or busy alias slots
-    for (let i = 0; i < 16; i++) {
+
+    for (let i = 0; i < 24; i++) {
       const candidate = generateRoomId();
       if (candidate === this.roomId || candidate === this.publicCode) continue;
+
+      if (!rooms) {
+        newCode = candidate;
+        break;
+      }
+
       try {
-        const aliasStub = rooms.get(rooms.idFromName(candidate));
+        const aliasStub = rooms.get(rooms.idFromName(aliasDoName(candidate)));
         const res = await aliasStub.fetch("https://do/init-alias", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -707,21 +727,40 @@ export class RoomDurableObject implements DurableObject {
         console.error("[ghostchat] init-alias failed", candidate, err);
       }
     }
-    if (!newCode) {
-      console.error("[ghostchat] rotatePublicCode: could not claim alias");
-      return null;
-    }
 
-    const oldPublic = this.publicCode;
-    // Clear previous alias (if it was not the primary DO name)
-    if (oldPublic && oldPublic !== this.roomId) {
-      try {
-        const oldAlias = rooms.get(rooms.idFromName(oldPublic));
-        await oldAlias.fetch("https://do/clear-alias", { method: "POST" });
-      } catch {
-        /* ignore */
+    // Last resort: still rotate the displayed code even if alias claim failed
+    if (!newCode) {
+      for (let i = 0; i < 8; i++) {
+        const candidate = generateRoomId();
+        if (candidate !== this.roomId && candidate !== this.publicCode) {
+          newCode = candidate;
+          break;
+        }
+      }
+      if (!newCode) return null;
+
+      if (rooms) {
+        try {
+          await rooms.get(rooms.idFromName(aliasDoName(newCode))).fetch(
+            "https://do/init-alias",
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ targetRoomId: this.roomId }),
+            }
+          );
+        } catch (err) {
+          console.error("[ghostchat] init-alias fallback failed", newCode, err);
+        }
+      } else {
+        console.error(
+          "[ghostchat] rotatePublicCode: ROOMS binding missing — code rotated in-memory only"
+        );
       }
     }
+
+    const oldPublic = this.publicCode || this.roomId;
+    await this.clearInviteAlias(oldPublic);
 
     this.publicCode = newCode;
     await this.state.storage.put("meta", {
@@ -733,6 +772,23 @@ export class RoomDurableObject implements DurableObject {
     } satisfies RoomMeta);
 
     return newCode;
+  }
+
+  /** Drop invite alias DOs (prefixed + legacy unprefixed). Never wipe the room DO. */
+  private async clearInviteAlias(publicCode: string) {
+    if (!publicCode || publicCode === this.roomId || !this.env?.ROOMS) return;
+    const rooms = this.env.ROOMS;
+    for (const name of [aliasDoName(publicCode), publicCode]) {
+      // Never clear the room DO itself
+      if (name === this.roomId) continue;
+      try {
+        await rooms.get(rooms.idFromName(name)).fetch("https://do/clear-alias", {
+          method: "POST",
+        });
+      } catch {
+        /* ignore */
+      }
+    }
   }
 
   private uniqueSessions(except?: WebSocket): Set<string> {
@@ -771,21 +827,7 @@ export class RoomDurableObject implements DurableObject {
         /* ignore */
       }
     }
-    // Drop current public alias if any
-    if (
-      this.env?.ROOMS &&
-      this.publicCode &&
-      this.publicCode !== this.roomId
-    ) {
-      try {
-        const oldAlias = this.env.ROOMS.get(
-          this.env.ROOMS.idFromName(this.publicCode)
-        );
-        await oldAlias.fetch("https://do/clear-alias", { method: "POST" });
-      } catch {
-        /* ignore */
-      }
-    }
+    await this.clearInviteAlias(this.publicCode || this.roomId);
     await this.state.storage.deleteAll();
     this.initialized = false;
   }
