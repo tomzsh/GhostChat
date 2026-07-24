@@ -183,7 +183,7 @@ export function promptStr(opts: {
 
 export function helpInline(): string {
   return c.dim(
-    "  commands  /ttl on_read|10s|60s   /who   /safety   /quit"
+    "  commands  /ttl on_read|on_leave|10s|60s   /who   /safety   /quit"
   );
 }
 

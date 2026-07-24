@@ -32,6 +32,7 @@ import {
   generateMessageId,
   isValidRoomId,
   isValidTtlMode,
+  isOnLeaveTtl,
   normalizeRoomId,
   parseTtlMs,
   randomChars,
@@ -52,7 +53,7 @@ function usage(): never {
   console.log(
     ui.box("USAGE", [
       ui.c.white("ghost create") +
-        ui.c.dim(" [--ttl 10s|60s|on_read] [--max N]"),
+        ui.c.dim(" [--ttl 10s|60s|on_read|on_leave] [--max N]"),
       ui.c.white("ghost join") + ui.c.dim(" <ROOM_ID>"),
       "",
       ui.c.dim(
@@ -123,6 +124,8 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
   let participantCount = 1;
   let ttlMode: TtlMode = defaultTtl;
   const burnTimers = new Map<string, NodeJS.Timeout>();
+  /** messageId → sender for `on_leave` burn mode */
+  const onLeaveMsgs = new Map<string, string>();
   let cleaned = false;
   const kpRetryTimers: NodeJS.Timeout[] = [];
   const adding = new Set<string>();
@@ -255,27 +258,32 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
     const t = burnTimers.get(id);
     if (t) clearTimeout(t);
     burnTimers.delete(id);
+    onLeaveMsgs.delete(id);
     ui.burned(id);
   }
 
-  /** Burn all tracked messages when a peer leaves the room. */
-  function burnAll(reason: string) {
-    const ids = [...burnTimers.keys()];
-    for (const id of ids) {
-      const t = burnTimers.get(id);
-      if (t) clearTimeout(t);
-      burnTimers.delete(id);
-    }
+  /** Burn `on_leave` messages from a departing sender. */
+  function burnOnLeaveFrom(senderId: string, reason: string) {
+    const ids = [...onLeaveMsgs.entries()]
+      .filter(([, from]) => from === senderId)
+      .map(([id]) => id);
+    for (const id of ids) burn(id);
     if (ids.length > 0) {
-      ui.sys(`messages burned · ${reason} (${ids.length})`);
-    } else {
-      ui.sys(`messages burned · ${reason}`);
+      ui.sys(`on_leave burned · ${reason} (${ids.length})`);
     }
   }
 
-  function scheduleBurn(messageId: string, mode: TtlMode, mine: boolean) {
-    const ms = parseTtlMs(mode);
-    if (ms === null) {
+  function scheduleBurn(
+    messageId: string,
+    mode: TtlMode,
+    mine: boolean,
+    fromId: string
+  ) {
+    if (isOnLeaveTtl(mode)) {
+      onLeaveMsgs.set(messageId, fromId);
+      return;
+    }
+    if (mode === "on_read") {
       if (!mine) {
         const t = setTimeout(() => {
           burn(messageId);
@@ -294,6 +302,8 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
       }
       return;
     }
+    const ms = parseTtlMs(mode);
+    if (ms === null) return;
     const t = setTimeout(() => {
       burn(messageId);
       if (!mine && ws.readyState === WebSocket.OPEN) {
@@ -353,7 +363,7 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
         pendingKp.delete(msg.peerId);
         participantCount = msg.participantCount ?? members.size + 1;
         ui.warn(`peer left · ${msg.peerId}`);
-        burnAll(`peer left · ${msg.peerId}`);
+        burnOnLeaveFrom(msg.peerId, `peer left · ${msg.peerId}`);
         if (mls?.state) {
           await enqueueMls(async () => {
             if (
@@ -447,7 +457,7 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
             mls = result.session;
             if (result.text) {
               ui.msgPeer(msg.from, result.text, msg.ttlMode);
-              scheduleBurn(msg.messageId, msg.ttlMode, false);
+              scheduleBurn(msg.messageId, msg.ttlMode, false, msg.from);
             }
           });
         } catch {
@@ -471,7 +481,7 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
         setPrompt();
         break;
       case "room_closed":
-        burnAll(`room closed · ${msg.reason}`);
+        for (const id of [...onLeaveMsgs.keys()]) burn(id);
         ui.sys(`room closed (${msg.reason})`);
         cleanup(0);
         break;
@@ -583,7 +593,7 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
           ttlMode = mode;
           ui.ok(`burn after → ${ui.c.yellow(ttlMode)}`);
           paintStatus();
-        } else ui.err("usage: /ttl on_read|10s|60s");
+        } else ui.err("usage: /ttl on_read|on_leave|10s|60s");
         setPrompt();
         return;
       }
@@ -621,7 +631,7 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
             })
           );
           ui.msgYou(input, ttlMode);
-          scheduleBurn(messageId, ttlMode, true);
+          scheduleBurn(messageId, ttlMode, true, myId);
         });
       } catch (e) {
         ui.err(e instanceof Error ? e.message : "send failed");
@@ -654,7 +664,7 @@ async function main() {
     if (ttlIdx >= 0 && args[ttlIdx + 1]) {
       const t = args[ttlIdx + 1]!;
       if (!isValidTtlMode(t)) {
-        ui.err("invalid --ttl (use 10s|60s|on_read)");
+        ui.err("invalid --ttl (use 10s|60s|on_read|on_leave)");
         process.exit(1);
       }
       ttl = t;

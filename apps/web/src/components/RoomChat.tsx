@@ -38,6 +38,12 @@ const TTL_OPTIONS: {
     short: "60s",
     hint: "Auto-delete ~60s after it appears",
   },
+  {
+    value: "on_leave",
+    label: "When I leave",
+    short: "leave",
+    hint: "No timed delete — burns when you (the sender) leave the room",
+  },
 ];
 
 function ttlShort(mode: TtlMode): string {
@@ -66,9 +72,7 @@ function statusLine(
     case "connecting":
       return "Connecting…";
     case "waiting_peer":
-      return memberCount === 0
-        ? "Waiting for peer… · chat burns on leave"
-        : "Waiting for peer…";
+      return "Waiting for peer…";
     case "ready": {
       const typing = typingStatus(typingPeers);
       if (typing) return typing;
@@ -76,9 +80,9 @@ function statusLine(
       return `Connected · ${memberCount} peers`;
     }
     case "peer_left":
-      return "Peer left · messages burned";
+      return "Peer left";
     case "closed":
-      return "Room closed · burned";
+      return "Room closed";
     case "error":
       return "Error";
     default:

@@ -23,7 +23,12 @@ import {
   type ServerMessage,
   type PeerInfo,
 } from "@ghostchat/protocol";
-import { generateMessageId, parseTtlMs, type TtlMode } from "@ghostchat/shared";
+import {
+  generateMessageId,
+  isOnLeaveTtl,
+  parseTtlMs,
+  type TtlMode,
+} from "@ghostchat/shared";
 import { getWsUrl } from "@/lib/config";
 import {
   clearCachedMlsSession,
@@ -281,11 +286,7 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     }
   }, []);
 
-  /**
-   * Burn every message in the local transcript (animation + clear timers).
-   * Used when a peer leaves — no durable chat trail after departure.
-   * Each remaining client does this on `peer_left` (no server message store).
-   */
+  /** Burn all local messages (leave room / room closed). */
   const burnAllMessages = useCallback(() => {
     clearBurnTimers();
     setMessages((prev) => {
@@ -297,16 +298,46 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     }, 450);
   }, [clearBurnTimers]);
 
+  /**
+   * Burn messages with burn mode `on_leave` from a specific sender
+   * (when that user leaves the room). Timed / on_read messages are unchanged.
+   */
+  const burnOnLeaveMessagesFrom = useCallback((senderId: string) => {
+    setMessages((prev) => {
+      const targets = prev.filter(
+        (m) => m.from === senderId && isOnLeaveTtl(m.ttlMode) && !m.burning
+      );
+      if (targets.length === 0) return prev;
+      for (const m of targets) {
+        const t = burnTimers.current.get(m.id);
+        if (t) {
+          clearTimeout(t);
+          burnTimers.current.delete(m.id);
+        }
+      }
+      const ids = new Set(targets.map((m) => m.id));
+      setTimeout(() => {
+        setMessages((cur) => cur.filter((m) => !ids.has(m.id)));
+      }, 450);
+      return prev.map((m) =>
+        ids.has(m.id) ? { ...m, burning: true } : m
+      );
+    });
+  }, []);
+
   const scheduleTtl = useCallback(
     (messageId: string, mode: TtlMode, mine: boolean) => {
-      const ms = parseTtlMs(mode);
-      if (ms === null) {
+      // Keep until sender leaves — no clock / on-read autodelete
+      if (isOnLeaveTtl(mode)) return;
+      if (mode === "on_read") {
         if (!mine) {
           const t = setTimeout(() => burnMessage(messageId, true), 2500);
           burnTimers.current.set(messageId, t);
         }
         return;
       }
+      const ms = parseTtlMs(mode);
+      if (ms === null) return;
       const t = setTimeout(() => burnMessage(messageId, !mine), ms);
       burnTimers.current.set(messageId, t);
     },
@@ -400,8 +431,8 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
         setTypingPeers((prev) => prev.filter((id) => id !== leftId));
         pendingKp.current.delete(leftId);
 
-        // Privacy: burn entire local transcript when anyone leaves
-        burnAllMessages();
+        // Burn only messages that used "on_leave" from the departing user
+        if (leftId) burnOnLeaveMessagesFrom(leftId);
 
         void enqueueMls(async () => {
           const session = mlsRef.current;

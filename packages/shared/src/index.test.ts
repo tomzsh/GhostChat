@@ -43,12 +43,14 @@ describe("room ids", () => {
 describe("ttl modes", () => {
   it("parses known modes", () => {
     assert.equal(parseTtlMs("on_read"), null);
+    assert.equal(parseTtlMs("on_leave"), null);
     assert.equal(parseTtlMs("10s"), 10_000);
     assert.equal(parseTtlMs("60s"), 60_000);
   });
 
   it("validates modes", () => {
     assert.ok(isValidTtlMode("on_read"));
+    assert.ok(isValidTtlMode("on_leave"));
     assert.ok(isValidTtlMode("10s"));
     assert.ok(isValidTtlMode("120s"));
     assert.equal(isValidTtlMode("0s"), false);

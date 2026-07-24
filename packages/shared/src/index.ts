@@ -76,17 +76,36 @@ export function clampMaxParticipants(n: unknown): number {
   return v;
 }
 
-export type TtlMode = "on_read" | "10s" | "60s" | `${number}s`;
+/**
+ * Message self-destruct modes (client-side only; server never stores plaintext).
+ * - `on_read` — burn shortly after recipient sees it
+ * - `10s` / `60s` / `Ns` — burn after N seconds on screen
+ * - `on_leave` — no timed autodelete; burn when the **sender** leaves the room
+ */
+export type TtlMode = "on_read" | "on_leave" | "10s" | "60s" | `${number}s`;
 
+/** Timed TTL in ms, or null for non-timed modes (`on_read`, `on_leave`). */
 export function parseTtlMs(mode: TtlMode): number | null {
-  if (mode === "on_read") return null;
+  if (mode === "on_read" || mode === "on_leave") return null;
   const m = /^(\d+)s$/.exec(mode);
   if (!m) return null;
   return parseInt(m[1]!, 10) * 1000;
 }
 
+/** Keep until the sender leaves — no clock / on-read autodelete. */
+export function isOnLeaveTtl(mode: TtlMode | string): boolean {
+  return mode === "on_leave";
+}
+
 export function isValidTtlMode(mode: string): mode is TtlMode {
-  if (mode === "on_read" || mode === "10s" || mode === "60s") return true;
+  if (
+    mode === "on_read" ||
+    mode === "on_leave" ||
+    mode === "10s" ||
+    mode === "60s"
+  ) {
+    return true;
+  }
   const m = /^(\d+)s$/.exec(mode);
   if (!m) return false;
   const n = parseInt(m[1]!, 10);

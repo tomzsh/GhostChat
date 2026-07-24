@@ -8,7 +8,7 @@ This file is the **primary entrypoint** for automated coding agents (Cursor, Cla
 
 **GhostChat** is a monorepo for **anonymous, ephemeral end-to-end encrypted chat** (1:1 and small groups via **MLS**). Clients: Next.js web + Node CLI. Backend: Cloudflare Worker + Durable Objects (ciphertext relay only — no message storage). Privacy principles override feature creep.
 
-**Version:** 2.1.0 · **Package manager:** pnpm 9 · **Node:** ≥ 20
+**Version:** 2.2.0 · **Package manager:** pnpm 9 · **Node:** ≥ 20
 
 ---
 

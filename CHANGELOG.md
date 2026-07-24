@@ -2,11 +2,16 @@
 
 All notable changes to GhostChat are documented in this file.
 
+## [2.2.0] — 2026-07-24
+
+### Added
+- Burn mode **`on_leave`** (“When I leave”): no timed/read autodelete; messages
+  burn when **that sender** leaves the room (web + CLI `/ttl on_leave`)
+
 ## [2.1.0] — 2026-07-23
 
 ### Added
-- **Burn on leave**: when any peer leaves (or the room closes), the local chat
-  transcript burns on remaining clients; leaving clears your device too
+- Leave/close clears local transcript; peers handle their own leave burns per mode
 
 ## [2.0.2] — 2026-07-23
 

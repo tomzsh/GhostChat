@@ -194,8 +194,8 @@ export function Landing() {
               server storage, no accounts.
             </li>
             <li>
-              When someone leaves (or you close the room), the chat transcript
-              burns on every device still open.
+              Burn modes: after read, 10s, 60s, or <strong className="text-white">when I leave</strong>{" "}
+              (no timer — hangus when the sender leaves).
             </li>
             <li>
               Not protected: compromised devices, sharing the room code with the
