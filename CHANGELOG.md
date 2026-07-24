@@ -8,6 +8,7 @@ All notable changes to GhostChat are documented in this file.
 - **Invite code rotation** when a member leaves (remaining peers get `room_code`;
   old share/QR invalid; WS stays on stable internal id via alias DO)
 - **Close room modal** with terminal ASCII animation (replaces `window.confirm`)
+- **Presence ASCII** banner when a peer joins or leaves
 
 ## [2.2.0] — 2026-07-24
 

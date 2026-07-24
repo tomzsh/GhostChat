@@ -153,6 +153,38 @@ body {
   max-width: 100%;
 }
 
+/* Peer join / leave banner */
+.presence-ascii {
+  transition:
+    opacity 0.22s ease,
+    max-height 0.28s ease,
+    padding 0.22s ease;
+  max-height: 8rem;
+  opacity: 1;
+  overflow: hidden;
+}
+.presence-ascii--out {
+  opacity: 0;
+  max-height: 0 !important;
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  border-bottom-width: 0 !important;
+  pointer-events: none;
+}
+.presence-ascii__art {
+  text-shadow: 0 0 8px rgba(51, 255, 102, 0.22);
+  min-width: 7rem;
+  animation: presence-flicker 0.9s ease-in-out infinite alternate;
+}
+@keyframes presence-flicker {
+  from {
+    filter: brightness(0.92);
+  }
+  to {
+    filter: brightness(1.08);
+  }
+}
+
 /* Close-room modal */
 .close-modal {
   animation: close-modal-in 0.2s ease-out;

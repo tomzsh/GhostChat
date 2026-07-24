@@ -10,6 +10,10 @@ import {
 } from "@/hooks/useGhostRoom";
 import { canNativeShare, copyText, shareRoomCode } from "@/lib/share";
 import { CloseRoomModal } from "./CloseRoomModal";
+import {
+  PresenceAscii,
+  type PresenceEvent,
+} from "./PresenceAscii";
 import { RoomQr } from "./RoomQr";
 import { SafetyNumber } from "./SafetyNumber";
 import { TerminalFrame } from "./TerminalFrame";
@@ -148,6 +152,11 @@ export function RoomChat({ roomId }: { roomId: string }) {
   const [closeModalOpen, setCloseModalOpen] = useState(false);
   const [supportsShare, setSupportsShare] = useState(false);
   const [showQr, setShowQr] = useState(true);
+  const [presenceEvent, setPresenceEvent] = useState<PresenceEvent | null>(
+    null
+  );
+  const presenceQueue = useRef<PresenceEvent[]>([]);
+  const prevMemberIds = useRef<string[] | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const feedbackTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -167,7 +176,7 @@ export function RoomChat({ roomId }: { roomId: string }) {
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages.length, typingPeers.length, meTyping, showQr]);
+  }, [messages.length, typingPeers.length, meTyping, showQr, presenceEvent]);
 
   // Keep --app-height in sync with visual viewport (mobile keyboard / browser chrome)
   useEffect(() => {
@@ -203,6 +212,34 @@ export function RoomChat({ roomId }: { roomId: string }) {
       prevCodeRef.current = publicCode;
     }
   }, [publicCode, flash]);
+
+  // Queue ASCII presence banners when members join / leave
+  useEffect(() => {
+    const curr = members.map((m) => m.id);
+    const prev = prevMemberIds.current;
+    prevMemberIds.current = curr;
+    // Skip first snapshot (initial join list — no banner spam)
+    if (prev === null) return;
+
+    const prevSet = new Set(prev);
+    const currSet = new Set(curr);
+    const events: PresenceEvent[] = [];
+    for (const id of curr) {
+      if (!prevSet.has(id)) events.push({ kind: "join", id });
+    }
+    for (const id of prev) {
+      if (!currSet.has(id)) events.push({ kind: "leave", id });
+    }
+    if (events.length === 0) return;
+
+    presenceQueue.current.push(...events);
+    setPresenceEvent((cur) => cur ?? presenceQueue.current.shift() ?? null);
+  }, [members]);
+
+  const onPresenceDone = useCallback(() => {
+    const next = presenceQueue.current.shift() ?? null;
+    setPresenceEvent(next);
+  }, []);
 
   useEffect(() => {
     return () => {
