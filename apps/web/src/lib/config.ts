@@ -38,8 +38,16 @@ export function getWsUrl(roomId: string): string {
   return `${base}/ws/${roomId}`;
 }
 
-/** Health check URL (REST). */
+/** Health check URL (REST) — same-origin rewrite or absolute worker API. */
 export function getHealthUrl(): string {
   const base = getApiBase();
-  return base ? `${base}/health` : "/api/health";
+  return base ? `${base}/api/health` : "/api/health";
+}
+
+/** True when running a local/dev build (not production hosting). */
+export function isLocalDevUi(): boolean {
+  if (process.env.NODE_ENV === "development") return true;
+  if (typeof window === "undefined") return false;
+  const h = window.location.hostname;
+  return h === "localhost" || h === "127.0.0.1" || h === "[::1]";
 }

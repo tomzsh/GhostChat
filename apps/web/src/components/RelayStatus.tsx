@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { checkRelayHealth } from "@/lib/api";
+import { isLocalDevUi } from "@/lib/config";
 
 type Status = "checking" | "online" | "offline";
 
@@ -17,7 +18,8 @@ export function RelayStatus() {
       const ok = await checkRelayHealth();
       if (!cancelled) setStatus(ok ? "online" : "offline");
       if (!cancelled) {
-        timer = setTimeout(probe, ok ? 30_000 : 8_000);
+        // Online: rare re-check. Offline: retry soon so recovery is fast.
+        timer = setTimeout(probe, ok ? 45_000 : 5_000);
       }
     };
 
@@ -42,11 +44,15 @@ export function RelayStatus() {
         ? "offline"
         : "…";
 
+  const offlineHint = isLocalDevUi()
+    ? "Relay offline — run pnpm dev:worker"
+    : "Relay offline — reconnecting…";
+
   const title =
     status === "online"
       ? "Relay online"
       : status === "offline"
-        ? "Relay offline — run pnpm dev:worker"
+        ? offlineHint
         : "Checking relay…";
 
   return (

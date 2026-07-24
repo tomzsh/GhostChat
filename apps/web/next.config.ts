@@ -33,8 +33,9 @@ const nextConfig: NextConfig = {
   async rewrites() {
     return [
       {
+        // Prefer canonical /api/health on worker; /health kept for older deploys
         source: "/api/health",
-        destination: `${workerOrigin}/health`,
+        destination: `${workerOrigin}/api/health`,
       },
       {
         source: "/api/rooms",

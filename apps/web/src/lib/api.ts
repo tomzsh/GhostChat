@@ -1,9 +1,15 @@
 import type { CreateRoomResponse, RoomStatusResponse } from "@ghostchat/protocol";
-import { getApiBase, getHealthUrl } from "./config";
+import { getApiBase, getHealthUrl, isLocalDevUi } from "./config";
 
 function apiUrl(path: string): string {
   const base = getApiBase();
   return `${base}${path}`;
+}
+
+function relayUnreachableMessage(): string {
+  return isLocalDevUi()
+    ? "Relay unreachable — run pnpm dev:worker"
+    : "Relay unreachable — try again in a moment";
 }
 
 export async function createRoom(options?: {
@@ -22,7 +28,7 @@ export async function createRoom(options?: {
   if (!res.ok) {
     throw new Error(
       res.status === 0 || res.type === "error"
-        ? "Relay unreachable — run pnpm dev:worker"
+        ? relayUnreachableMessage()
         : `Failed to create room (${res.status})`
     );
   }
@@ -45,16 +51,53 @@ export async function getRoomStatus(
   return res.json() as Promise<RoomStatusResponse>;
 }
 
-/** Quick relay health probe for the landing page. */
-export async function checkRelayHealth(): Promise<boolean> {
+function abortAfter(ms: number): AbortSignal {
+  if (typeof AbortSignal !== "undefined" && "timeout" in AbortSignal) {
+    return AbortSignal.timeout(ms);
+  }
+  const c = new AbortController();
+  setTimeout(() => c.abort(), ms);
+  return c.signal;
+}
+
+async function probeHealth(url: string): Promise<boolean> {
   try {
-    const res = await fetch(getHealthUrl(), {
+    const res = await fetch(url, {
       method: "GET",
       cache: "no-store",
+      // Don't hang the landing UI if relay is slow
+      signal: abortAfter(6_000),
     });
     if (!res.ok) return false;
-    const body = (await res.json()) as { ok?: boolean };
+    const body = (await res.json()) as { ok?: boolean; service?: string };
     return body.ok === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Quick relay health probe for the landing page.
+ * Tries canonical path first, then legacy /health for older worker deploys.
+ */
+export async function checkRelayHealth(): Promise<boolean> {
+  const primary = getHealthUrl();
+  if (await probeHealth(primary)) return true;
+
+  // Fallback: same host with the alternate path
+  try {
+    const u = new URL(
+      primary,
+      typeof window !== "undefined" ? window.location.origin : "http://127.0.0.1"
+    );
+    if (u.pathname.endsWith("/api/health")) {
+      u.pathname = u.pathname.replace(/\/api\/health$/, "/health");
+    } else if (u.pathname.endsWith("/health")) {
+      u.pathname = u.pathname.replace(/\/health$/, "/api/health");
+    } else {
+      return false;
+    }
+    return probeHealth(u.toString());
   } catch {
     return false;
   }

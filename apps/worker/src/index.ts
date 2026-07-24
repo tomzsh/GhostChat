@@ -224,7 +224,11 @@ export default {
       return stub.fetch(doUrl.toString(), request);
     }
 
-    if (path === "/api/health" && request.method === "GET") {
+    // Both paths: Next rewrites historically used /health; clients may call /api/health
+    if (
+      (path === "/api/health" || path === "/health") &&
+      request.method === "GET"
+    ) {
       return json({ ok: true, service: "ghostchat-worker" });
     }
 

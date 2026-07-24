@@ -892,7 +892,11 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
       ws.onerror = () => {
         if (reconnectAttempt.current === 0 && !disposed) {
           setError(
-            `Connection failed (${url}). Start worker: pnpm dev:worker`
+            typeof window !== "undefined" &&
+              (window.location.hostname === "localhost" ||
+                window.location.hostname === "127.0.0.1")
+              ? `Connection failed (${url}). Start worker: pnpm dev:worker`
+              : `Connection failed — check network and try again`
           );
         }
       };
