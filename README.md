@@ -6,10 +6,11 @@
 
 <p align="center">
   <strong>English</strong> · <a href="./README.id.md">Bahasa Indonesia</a>
-  · <a href="https://github.com/tomzsh/ghostchat/releases/tag/v2.5.0">v2.5.0</a>
+  · <a href="https://github.com/tomzsh/GhostChat/releases/tag/v2.5.0">v2.5.0</a>
+  · <a href="https://ghostchat-web-two.vercel.app/">Live demo</a>
 </p>
 
-Anonymous, **ephemeral**, **end-to-end encrypted** chat (1:1 and small groups via **MLS**).  
+Anonymous, **ephemeral**, **end-to-end encrypted** chat for **1:1 and small groups** (MLS).  
 No accounts. No permanent history. No plaintext on the server.
 
 > Privacy by design: the server is only a **relay** for ciphertext. When a room is empty, its in-memory state is destroyed.
@@ -51,7 +52,8 @@ GhostChat solves a narrow problem: **talk privately right now, and leave no dura
 | Identity | Random `Anon-XXXX` per session — no signup |
 | Storage | No message history on the server |
 | Encryption | **MLS (RFC 9420)** on clients (`ts-mls`); server relays ciphertext only |
-| Room access | 6-character code (or link / QR); creator sets max members 2–20 |
+| Room access | 6-character code (or link / QR); creator sets max members **2–20** |
+| Invite hygiene | **Room code rotates** when someone leaves so old links stop working |
 | Lifecycle | Destroyed when empty, idle 10 min, or max age 24 h |
 
 Clients: **Web (Next.js)** and **CLI (`ghost`)** share the same Cloudflare Worker backend.
@@ -60,26 +62,27 @@ Clients: **Web (Next.js)** and **CLI (`ghost`)** share the same Cloudflare Worke
 
 ## Features
 
-### Product (MVP)
+### Product
 
-- Create / join rooms (max **2–20** members, creator chooses)
-- Realtime chat over WebSocket
-- End-to-end encryption with **MLS** (keys never leave the client)
-- Typing indicator + animated ASCII “people chatting” (web)
-- Message self-destruct (**Burn after**: read / 10s / 60s)
-- **Safety number** — both peers compare digits to detect MITM
-- **QR code** join URL (web)
-- Copy / native share of room code
-- Close room (explicit leave)
+- Create / join rooms (**2–20** members, creator chooses)
+- Realtime chat over WebSocket with **MLS** group E2EE
+- **Invite code rotation** on leave (remaining peers get a new share/QR code)
+- Burn modes: **after read · 10s · 60s · when I leave**
+- **Safety number** (epoch-bound) to detect MITM
+- **Ephemeral images** — client JPEG compress (≤1MB), chunked E2EE send
+- **Animated ASCII emoji** picker (web)
+- Multi-peer typing chips + presence ASCII banners (web)
+- QR join, copy / native share of room code
+- Close-room modal (ASCII terminal style)
 - Relay health indicator on landing
 - Polished terminal CLI UI
 
 ### Infrastructure
 
-- Cloudflare Workers + Durable Objects (one DO = one room)
-- WebSocket Hibernation-friendly room design
+- Cloudflare Workers + Durable Objects (one room DO + invite alias DOs)
+- WebSocket hibernation-friendly room design
 - Rate limits: room create & join probes per IP
-- Same-origin REST via Next.js rewrites in local/production web
+- Same-origin REST via Next.js rewrites (`/api/*` → worker)
 - Unit tests for crypto, shared utils, rate limiter
 
 ---
@@ -90,21 +93,24 @@ Clients: **Web (Next.js)** and **CLI (`ghost`)** share the same Cloudflare Worke
 ┌──────────────┐         WSS          ┌─────────────────────────────┐
 │  Web Client  │ ───────────────────▶ │  Cloudflare Worker          │
 │  (Next.js)   │         HTTPS        │  POST/GET /api/rooms        │
-└──────────────┘                      │  WS   /ws/:roomId           │
-                                      │            │                │
-┌──────────────┐         WSS          │            ▼                │
-│  CLI Client  │ ───────────────────▶ │  Durable Object: Room       │
-│  (Node.js)   │                      │  · connections (max 2)      │
-└──────────────┘                      │  · relay ciphertext only    │
+└──────────────┘                      │  GET  /api/health|/health   │
+                                      │  WS   /ws/:roomId           │
+┌──────────────┐         WSS          │            │                │
+│  CLI Client  │ ───────────────────▶ │            ▼                │
+│  (Node.js)   │                      │  Durable Object: Room       │
+└──────────────┘                      │  · max 2–20 sessions        │
+                                      │  · relay ciphertext only    │
+                                      │  · rotate public invite     │
                                       └─────────────────────────────┘
          Private keys & plaintext never leave the client
 ```
 
 **Data flow (message):**
 
-1. Peer A encrypts plaintext with the shared AEAD key → `ciphertext` + `nonce`
-2. Worker Durable Object forwards the frame to peer B (no decryption)
-3. Peer B decrypts locally; optional TTL/`burn` syncs UI destruction
+1. Client encrypts application data with **MLS** → `ciphertext` (`nonce: "mls"`)
+2. Worker Durable Object forwards the frame (no decryption)
+3. Peers decrypt locally; optional TTL / `burn` syncs UI destruction
+4. Images are compressed, then sent as **paced MLS chunks** and reassembled in memory
 
 ---
 
@@ -119,7 +125,12 @@ ghostchat/
 ├── packages/
 │   ├── crypto/              # MLS (ts-mls) + legacy pairwise helpers
 │   ├── protocol/            # Shared WS message types & parsers
-│   └── shared/              # Room codes, limits, TTL helpers
+│   └── shared/              # Room codes, limits, TTL, app payloads
+├── docs/
+│   ├── ARCHITECTURE.md
+│   ├── cover.svg            # Cover source
+│   └── assets/cover.png     # README banner
+├── AGENTS.md                # Guide for AI coding agents
 ├── package.json             # pnpm workspace root
 ├── README.md                # This file (English)
 └── README.id.md             # Bahasa Indonesia
@@ -132,7 +143,7 @@ ghostchat/
 | Tool | Version |
 |---|---|
 | Node.js | ≥ 20 |
-| pnpm | 9.x (see `packageManager` in root `package.json`) |
+| pnpm | 9+ (see `packageManager` in root `package.json`) |
 | Cloudflare account | Only for production deploy of the worker |
 
 ---
@@ -155,7 +166,7 @@ pnpm dev:web
 # → http://localhost:3000
 ```
 
-Then open the web UI, **Create Room**, share the code/QR with a second browser or the CLI.
+Then open the web UI, **Create Room**, share the code/QR with another browser or the CLI.
 
 ---
 
@@ -166,15 +177,16 @@ Then open the web UI, **Create Room**, share the code/QR with a second browser o
 | Route | Description |
 |---|---|
 | `/` | Landing: create room, join by code, relay status |
-| `/r/[roomId]` | Chat room: messages, TTL, QR, safety number |
+| `/r/[roomId]` | Chat room: messages, burn mode, QR, safety number, images, emoji |
 
 ### UX notes
 
 - **Mobile-first** layout, safe areas, large touch targets
 - **Burn after** selector (not raw “TTL”) with short helper text
-- **Safety number** appears when the encrypted channel is ready — both sides must match
-- **QR** encodes `https://<origin>/r/<ROOM_ID>` for camera scan-to-join
+- **Safety number** when the MLS group is ready — compare out-of-band
+- **QR** encodes `https://<origin>/r/<CODE>`; code can rotate mid-session
 - Session identity uses `sessionStorage` only (not `localStorage`)
+- Images: always client-compressed JPEG, then chunked E2EE
 
 ### Local env (`apps/web/.env.local`)
 
@@ -200,7 +212,8 @@ Prefer **`127.0.0.1`** over `localhost` for the worker URL so browsers do not hi
 ```bash
 # Create a room and enter the session
 pnpm --filter @ghostchat/cli start create
-pnpm --filter @ghostchat/cli start create --ttl 10s   # 10s | 60s | on_read
+pnpm --filter @ghostchat/cli start create --max 6
+pnpm --filter @ghostchat/cli start create --ttl on_leave
 
 # Join an existing room
 pnpm --filter @ghostchat/cli start join AB92KF
@@ -210,11 +223,11 @@ pnpm --filter @ghostchat/cli start join AB92KF
 
 | Command | Action |
 |---|---|
-| `/ttl on_read\|10s\|60s` | Change burn mode for outgoing messages |
+| `/ttl on_read\|10s\|60s\|on_leave` | Burn mode for outgoing messages |
 | `/who` / `/status` | Status bar + safety number |
 | `/safety` / `/fp` | Show safety number only |
 | `/help` | Command list |
-| `/quit` | Leave room |
+| `/quit` | Leave room (triggers invite rotation for others) |
 
 ### Environment
 
@@ -233,65 +246,72 @@ pnpm --filter @ghostchat/cli start join AB92KF
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/rooms` | Create room → `{ roomId, wsUrl }` |
-| `GET` | `/api/rooms/:id` | Status: `ok` / `not_found` / full flag |
-| `GET` | `/health` | Liveness `{ ok: true }` |
+| `POST` | `/api/rooms` | Create room → `{ roomId, wsUrl, maxParticipants }` |
+| `GET` | `/api/rooms/:id` | Status: `ok` / `not_found` / full flag (+ `publicCode` / `internalId`) |
+| `GET` | `/api/health` or `/health` | Liveness `{ ok: true, service: "ghostchat-worker" }` |
 
 ### WebSocket
 
 | Path | Description |
 |---|---|
-| `/ws/:roomId` | Upgrade; first frame must be `join` |
+| `/ws/:roomId` | Upgrade; first frame must be `join`. Resolves invite aliases. |
 
-### Limits (defaults)
+### Limits (defaults in `@ghostchat/shared` `LIMITS`)
 
 | Limit | Value |
 |---|---|
-| Max participants / room | 2 |
+| Max participants / room | 2–20 (creator chooses; default 2) |
 | Max messages / connection / second | 5 |
-| Max ciphertext size (approx) | 4 KB |
+| Max image (compressed) | 1 MB |
+| Image chunk size | ~24 KB (paced send) |
+| Max ciphertext (wire) | ~2.5 MB |
 | Create rooms / IP / minute | 10 |
 | Join probes (GET + WS) / IP / minute | 30 |
 | Idle timeout | 10 minutes |
 | Max room age | 24 hours |
 | Empty-room grace | 30 seconds |
 
-Configured in `packages/shared` (`LIMITS`) and enforced in the worker.
-
 ### Durable Object
 
 - Class: `RoomDurableObject` (`apps/worker/src/room.ts`)
-- Addressing: `idFromName(roomId)`
+- Room DO: stable **internal** id; public invite may be a separate **alias** DO (`a:CODE`)
 - Stores **no message content** — only short-lived metadata / alarms
-- Sessions are unique by client `sessionToken` (reconnect-safe)
+- Sessions unique by client `sessionToken` (reconnect-safe; Strict Mode safe)
+- Explicit `leave` frame + socket close both rotate the invite when others remain
 
 ---
 
 ## Protocol
 
-All frames are JSON with `"v": 1`.
+Wire major version: **`v: 2`** (MLS). Types live in `packages/protocol`.
 
 **Client → server (examples):**
 
 ```json
-{ "v": 1, "type": "join", "displayId": "Anon-4XJ9", "publicKey": "<base64>", "sessionToken": "..." }
-{ "v": 1, "type": "message", "ciphertext": "...", "nonce": "...", "ttlMode": "60s", "messageId": "m_..." }
-{ "v": 1, "type": "typing", "state": true }
-{ "v": 1, "type": "burn", "messageId": "m_..." }
-{ "v": 1, "type": "ping" }
+{ "v": 2, "type": "join", "displayId": "Anon-4XJ9", "publicKey": "mls", "sessionToken": "..." }
+{ "v": 2, "type": "message", "ciphertext": "...", "nonce": "mls", "ttlMode": "60s", "messageId": "m_..." }
+{ "v": 2, "type": "typing", "state": true }
+{ "v": 2, "type": "burn", "messageId": "m_..." }
+{ "v": 2, "type": "mls_key_package", "package": "..." }
+{ "v": 2, "type": "mls_welcome", "to": "Anon-…", "welcome": "..." }
+{ "v": 2, "type": "mls_commit", "commit": "..." }
+{ "v": 2, "type": "leave" }
+{ "v": 2, "type": "ping" }
 ```
 
 **Server → client (examples):**
 
 ```json
-{ "v": 1, "type": "joined", "yourId": "Anon-4XJ9", "peerId": null, "peerPublicKey": null, "sessionToken": "..." }
-{ "v": 1, "type": "peer_joined", "peerId": "Anon-7QW2", "peerPublicKey": "..." }
-{ "v": 1, "type": "message", "from": "Anon-7QW2", "ciphertext": "...", "nonce": "...", "ttlMode": "60s", "messageId": "m_..." }
-{ "v": 1, "type": "error", "code": "room_full" }
-{ "v": 1, "type": "room_closed", "reason": "idle_timeout" }
+{ "v": 2, "type": "joined", "yourId": "Anon-4XJ9", "sessionToken": "...", "peers": [], "internalId": "…", "publicCode": "…" }
+{ "v": 2, "type": "peer_joined", "peerId": "Anon-7QW2", "participantCount": 2 }
+{ "v": 2, "type": "peer_left", "peerId": "Anon-7QW2", "participantCount": 1, "publicCode": "NEWID1" }
+{ "v": 2, "type": "room_code", "publicCode": "NEWID1" }
+{ "v": 2, "type": "message", "from": "Anon-7QW2", "ciphertext": "...", "nonce": "mls", "ttlMode": "60s", "messageId": "m_..." }
+{ "v": 2, "type": "error", "code": "room_full" }
+{ "v": 2, "type": "room_closed", "reason": "idle_timeout" }
 ```
 
-Shared TypeScript types live in `packages/protocol`.
+Application plaintext may be plain text, or structured payloads (`GCIMG1` / `GCIMGC1` images, `GCEMO1` emoji) defined in `@ghostchat/shared`.
 
 ---
 
@@ -300,16 +320,16 @@ Shared TypeScript types live in `packages/protocol`.
 | Step | Algorithm | Library |
 |---|---|---|
 | Group E2EE | **MLS (RFC 9420)** | `ts-mls` |
-| Ciphersuite | MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 | `ts-mls` / `@hpke/core` |
-| Safety number | SHA-256 of MLS `confirmedTranscriptHash` → `XXXXX XXXXX XXXXX` | `@noble/hashes` |
+| Ciphersuite | `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` | `ts-mls` / HPKE |
+| Safety number | SHA-256 of MLS `confirmedTranscriptHash` | `@noble/hashes` |
 | Protocol | `PROTOCOL_VERSION = 2` | `@ghostchat/protocol` |
 
 **Rules:**
 
 - Private keys and MLS group state stay in process / tab memory only
-- Server sees MLS ciphertext frames + presence metadata only (never group secrets)
-- Safety number is epoch-bound — re-compare after joins; mismatch ⇒ treat as compromised
-- `ts-mls` is not formally audited
+- Server sees MLS ciphertext + presence metadata only (never group secrets)
+- Safety number is **epoch-bound** — re-compare after joins/leaves
+- `ts-mls` is not formally audited — use at your own risk for high-threat scenarios
 
 ---
 
@@ -320,18 +340,20 @@ Shared TypeScript types live in `packages/protocol`.
 - Network eavesdroppers / server operators cannot read message plaintext
 - No durable message store to subpoena after the room is gone
 - No account graph tying chats to email/phone
+- Departed members cannot rejoin with an old invite once the code rotated
 
 ### Not protected
 
 - Compromised endpoints (malware, screen capture)
-- Anyone who knows the room code can join as the second peer — **the code is the secret**
-- MITM during first key exchange if the code channel is hostile (mitigate with **safety number**)
+- Anyone who knows the **current** room code can join (capacity permitting)
+- MITM if the invite channel is hostile — mitigate with **safety number**
 - Legal/abuse content — server cannot moderate ciphertext
 
 ### Operational mitigations
 
 - Rate limits on create/join
 - Short room lifetime
+- Invite rotation on leave
 - Optional peer comparison of safety numbers
 
 ---
@@ -386,17 +408,17 @@ pnpm test
 
 | Package | Coverage |
 |---|---|
-| `@ghostchat/crypto` | ECDH agreement, AEAD encrypt/decrypt, tamper, safety number |
-| `@ghostchat/shared` | Room IDs, TTL parsing |
+| `@ghostchat/crypto` | MLS 2-/3-party join + message + remove; legacy AEAD helpers |
+| `@ghostchat/shared` | Room IDs, TTL, image/emoji payloads, **chunk reassembly** |
 | `@ghostchat/worker` | Sliding-window rate limiter |
 
 Manual E2E ideas:
 
-1. Web create → CLI join → bidirectional chat  
-2. CLI create → Web join via code or QR  
-3. Compare safety numbers  
-4. Refresh one tab — session should reconnect without “room full”  
-5. Close room — peer sees leave / room lifecycle  
+1. Web create (max 3) → two more clients join → chat  
+2. One peer leaves → remaining peers see **new room code**; old code fails join  
+3. Send compressed image → peer receives preview; burns with TTL  
+4. Compare safety numbers after each join  
+5. Refresh one tab — reconnect without false `peer_left` / room full  
 
 ---
 
@@ -406,22 +428,23 @@ Manual E2E ideas:
 
 ```bash
 cd apps/worker
-# set PUBLIC_WS_ORIGIN=wss://your-subdomain.workers.dev in wrangler.toml or dashboard
+# set PUBLIC_WS_ORIGIN=wss://your-worker.subdomain.workers.dev
 pnpm deploy
+# or: wrangler deploy --name <worker> --var PUBLIC_WS_ORIGIN:wss://…
 ```
 
 Requires a Workers plan that supports **Durable Objects**.
 
 ### Web (e.g. Vercel)
 
-1. Root or `apps/web` as the project directory  
-2. Build: `pnpm build` (from monorepo) or Next build with workspace packages  
+1. Root of the monorepo as the project directory  
+2. Build: `pnpm build`  
 3. Env:
    - `NEXT_PUBLIC_WS_URL=wss://your-worker…`
-   - `WORKER_URL=https://your-worker…` (for rewrites)
+   - `WORKER_URL=https://your-worker…` (for `/api/*` rewrites)
    - optionally `NEXT_PUBLIC_API_URL=https://your-worker…`
 
-Configure CORS on the worker if the browser calls the worker origin directly (rewrites avoid this for REST).
+Health probe uses same-origin `/api/health` → rewrite → worker `/api/health` (also accepts `/health`).
 
 ---
 
@@ -429,11 +452,13 @@ Configure CORS on the worker if the browser calls the worker origin directly (re
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| “relay offline” on landing | Worker not running | `pnpm dev:worker` |
-| WebSocket errors | Wrong host / IPv6 | Use `127.0.0.1` in `NEXT_PUBLIC_WS_URL` |
-| Stuck “waiting for peer” | Old double-session bug / peer got `room_full` | Hard refresh; use latest code; one tab per peer |
-| Cannot send | Peer left / no shared key | Wait for peer; check safety number after rejoin |
-| Room not found | Expired or wrong code | Create a new room (max age / empty grace) |
+| “relay offline” (local) | Worker not running | `pnpm dev:worker` |
+| “relay offline” (prod) | `WORKER_URL` wrong / rewrite miss | Point `WORKER_URL` at worker origin; ensure `/api/health` works |
+| WebSocket errors | Wrong host / IPv6 | Prefer `127.0.0.1` locally; `wss://` in prod |
+| Stuck “waiting for peer” | Room full / double session | One tab per peer; hard refresh |
+| Code does not change on leave | Stale worker deploy | Redeploy worker (leave + rotate logic) |
+| Cannot send image | Over size / not compressed | Max **1MB** after compress; wait for MLS ready |
+| Room not found | Expired, rotated, or wrong code | Use the **current** share code |
 | Rate limited | Too many creates/joins | Wait ~1 minute |
 | CLI cannot connect | Worker down or env wrong | Check `GHOST_API_URL` / `GHOST_WS_URL` |
 
@@ -441,11 +466,11 @@ Configure CORS on the worker if the browser calls the worker origin directly (re
 
 ## Roadmap
 
-Possible later work (not required for MVP):
+Possible later work:
 
-- Production deploy checklist & multi-env configs  
-- PWA / installable web app  
-- Longer reconnect grace on the server  
+- Multi-env deploy configs  
+- PWA / installable web  
+- Longer reconnect grace  
 - Optional room passphrase  
 - In-app QR scanner  
 - Post-quantum MLS ciphersuites (X-Wing / ML-KEM)
