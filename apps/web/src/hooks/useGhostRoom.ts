@@ -109,6 +109,8 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
   const [ttlMode, setTtlMode] = useState<TtlMode>(defaultTtl);
   const [error, setError] = useState<string | null>(null);
   const [safetyNumber, setSafetyNumber] = useState<string | null>(null);
+  /** Public invite code (rotates when someone leaves). */
+  const [publicCode, setPublicCode] = useState(roomId);
 
   const wsRef = useRef<WebSocket | null>(null);
   const mlsRef = useRef<MlsSession | null>(null);
@@ -139,6 +141,11 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
   myIdRef.current = myId;
   membersRef.current = members;
   messagesRef.current = messages;
+
+  // Keep publicCode in sync if parent navigates to a new invite URL
+  useEffect(() => {
+    setPublicCode(roomId);
+  }, [roomId]);
 
   const enqueueMls = useCallback(<T,>(fn: () => Promise<T>): Promise<T> => {
     const next = mlsQueue.current.then(fn, fn);
@@ -594,6 +601,25 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
         intentionalClose.current = true;
         break;
       }
+      case "room_code": {
+        const code = String(msg.publicCode ?? "")
+          .trim()
+          .toUpperCase();
+        if (!code) break;
+        setPublicCode((prev) => (prev === code ? prev : code));
+        // Soft URL update — do not remount room / drop WS
+        if (typeof window !== "undefined") {
+          try {
+            const path = `/r/${code}`;
+            if (window.location.pathname !== path) {
+              window.history.replaceState(null, "", path);
+            }
+          } catch {
+            /* ignore */
+          }
+        }
+        break;
+      }
       case "pong":
         break;
     }
@@ -874,6 +900,8 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     state: displayState,
     myId,
     peerId,
+    /** Current shareable invite code (may rotate after someone leaves). */
+    publicCode,
     members,
     maxParticipants,
     participantCount: Math.max(

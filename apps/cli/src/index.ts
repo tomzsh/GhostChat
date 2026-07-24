@@ -122,6 +122,7 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
   const pendingKp = new Map<string, string>();
   let maxParticipants: number = 2;
   let participantCount = 1;
+  let publicCode = roomId;
   let ttlMode: TtlMode = defaultTtl;
   const burnTimers = new Map<string, NodeJS.Timeout>();
   /** messageId → sender for `on_leave` burn mode */
@@ -154,7 +155,10 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
         : [...members.keys()].map((id) => ui.c.cyan(id)).join(ui.c.dim(", "));
     ui.printLine(
       ui.c.dim("  room ") +
-        ui.c.bold(ui.c.brightGreen(roomId)) +
+        ui.c.bold(ui.c.brightGreen(publicCode)) +
+        (publicCode !== roomId
+          ? ui.c.dim(` (was ${roomId})`)
+          : "") +
         ui.c.dim("  you ") +
         ui.c.cyan(myId) +
         ui.c.dim(`  ${participantCount}/${maxParticipants}`) +
@@ -364,6 +368,7 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
         participantCount = msg.participantCount ?? members.size + 1;
         ui.warn(`peer left · ${msg.peerId}`);
         burnOnLeaveFrom(msg.peerId, `peer left · ${msg.peerId}`);
+        // room_code frame follows from server when others remain
         if (mls?.state) {
           await enqueueMls(async () => {
             if (
@@ -485,6 +490,19 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
         ui.sys(`room closed (${msg.reason})`);
         cleanup(0);
         break;
+      case "room_code": {
+        const code = String(msg.publicCode ?? "")
+          .trim()
+          .toUpperCase();
+        if (code && code !== publicCode) {
+          publicCode = code;
+          ui.warn(`invite code rotated → ${ui.c.brightGreen(publicCode)}`);
+          ui.sys("old code no longer works for new joiners");
+          paintStatus();
+        }
+        setPrompt();
+        break;
+      }
       case "pong":
         break;
     }

@@ -7,10 +7,15 @@ import {
 import {
   LIMITS,
   generateDisplayId,
+  generateRoomId,
   isValidTtlMode,
   randomChars,
   clampMaxParticipants,
 } from "@ghostchat/shared";
+
+export interface RoomEnv {
+  ROOMS: DurableObjectNamespace;
+}
 
 type Attachment = {
   displayId: string;
@@ -20,49 +25,73 @@ type Attachment = {
   messageTimestamps: number[];
 };
 
+type RoomMeta = {
+  kind: "room";
+  roomId: string;
+  publicCode: string;
+  createdAt: number;
+  maxParticipants: number;
+};
+
+type AliasMeta = {
+  kind: "alias";
+  targetRoomId: string;
+};
+
 const ALARM_IDLE = "idle";
 const ALARM_MAX_AGE = "max_age";
+
 function isLiveAttachment(a: Attachment | null | undefined): a is Attachment {
   return !!a && !a.sessionToken.endsWith("__replaced");
 }
 
-/** Join publicKey is presence-only under MLS (v2); accept short markers. */
 function isValidJoinPublicKey(pk: string): boolean {
   if (!pk || pk.length > 128) return false;
   return true;
 }
 
 function isValidMlsPayload(s: string): boolean {
-  return typeof s === "string" && s.length > 0 && s.length <= LIMITS.maxMlsPayloadBytes;
+  return (
+    typeof s === "string" &&
+    s.length > 0 &&
+    s.length <= LIMITS.maxMlsPayloadBytes
+  );
 }
 
 /**
- * One Durable Object = one room (1:1 or group).
+ * One Durable Object = one room (or a short-lived invite-code alias).
  * Relays ciphertext + MLS control frames only; never stores messages or keys.
  */
 export class RoomDurableObject implements DurableObject {
   private state: DurableObjectState;
+  private env: RoomEnv;
   private roomId = "";
+  private publicCode = "";
   private createdAt = 0;
   private initialized = false;
+  private isAlias = false;
+  private aliasTarget = "";
   private maxParticipants: number = LIMITS.defaultMaxParticipants;
 
-  constructor(state: DurableObjectState) {
+  constructor(state: DurableObjectState, env: RoomEnv) {
     this.state = state;
+    this.env = env;
     this.state.blockConcurrencyWhile(async () => {
-      const meta = await this.state.storage.get<{
-        roomId: string;
-        createdAt: number;
-        maxParticipants?: number;
-      }>("meta");
-      if (meta) {
-        this.roomId = meta.roomId;
-        this.createdAt = meta.createdAt;
-        this.maxParticipants = clampMaxParticipants(
-          meta.maxParticipants ?? LIMITS.defaultMaxParticipants
-        );
+      const meta = await this.state.storage.get<RoomMeta | AliasMeta>("meta");
+      if (!meta) return;
+      if (meta.kind === "alias") {
+        this.isAlias = true;
+        this.aliasTarget = meta.targetRoomId;
         this.initialized = true;
+        return;
       }
+      this.roomId = meta.roomId;
+      this.publicCode = meta.publicCode || meta.roomId;
+      this.createdAt = meta.createdAt;
+      this.maxParticipants = clampMaxParticipants(
+        meta.maxParticipants ?? LIMITS.defaultMaxParticipants
+      );
+      this.initialized = true;
     });
   }
 
@@ -77,32 +106,69 @@ export class RoomDurableObject implements DurableObject {
       };
       if (!this.initialized) {
         this.roomId = body.roomId;
+        this.publicCode = body.roomId;
         this.createdAt = Date.now();
         this.maxParticipants = clampMaxParticipants(body.maxParticipants);
         this.initialized = true;
+        this.isAlias = false;
         await this.state.storage.put("meta", {
+          kind: "room",
           roomId: this.roomId,
+          publicCode: this.publicCode,
           createdAt: this.createdAt,
           maxParticipants: this.maxParticipants,
-        });
+        } satisfies RoomMeta);
         await this.state.storage.setAlarm(Date.now() + LIMITS.maxAgeMs);
         await this.state.storage.put("alarmKind", ALARM_MAX_AGE);
       }
       return Response.json({
         ok: true,
-        roomId: this.roomId,
+        roomId: this.publicCode,
+        internalId: this.roomId,
         maxParticipants: this.maxParticipants,
       });
+    }
+
+    if (path === "/init-alias" && request.method === "POST") {
+      const body = (await request.json()) as { targetRoomId: string };
+      if (this.initialized && !this.isAlias) {
+        return Response.json({ ok: false, error: "occupied" }, { status: 409 });
+      }
+      this.isAlias = true;
+      this.aliasTarget = body.targetRoomId;
+      this.initialized = true;
+      await this.state.storage.put("meta", {
+        kind: "alias",
+        targetRoomId: body.targetRoomId,
+      } satisfies AliasMeta);
+      return Response.json({ ok: true, targetRoomId: body.targetRoomId });
+    }
+
+    if (path === "/clear-alias" && request.method === "POST") {
+      if (this.isAlias) {
+        await this.state.storage.deleteAll();
+        this.initialized = false;
+        this.isAlias = false;
+        this.aliasTarget = "";
+      }
+      return Response.json({ ok: true });
     }
 
     if (path === "/status" && request.method === "GET") {
       if (!this.initialized) {
         return Response.json({ status: "not_found" });
       }
+      if (this.isAlias) {
+        return Response.json({
+          status: "alias",
+          targetRoomId: this.aliasTarget,
+        });
+      }
       const count = this.uniqueSessions().size;
       return Response.json({
         status: "ok",
-        roomId: this.roomId,
+        roomId: this.publicCode,
+        internalId: this.roomId,
         participantCount: count,
         maxParticipants: this.maxParticipants,
         full: count >= this.maxParticipants,
@@ -114,6 +180,16 @@ export class RoomDurableObject implements DurableObject {
         return new Response(JSON.stringify({ error: "room_not_found" }), {
           status: 404,
         });
+      }
+      if (this.isAlias) {
+        // Worker index should resolve aliases before upgrading; belt-and-suspenders
+        return new Response(
+          JSON.stringify({
+            error: "room_not_found",
+            aliasTo: this.aliasTarget,
+          }),
+          { status: 404 }
+        );
       }
 
       if (this.isPastMaxAge()) {
@@ -247,6 +323,7 @@ export class RoomDurableObject implements DurableObject {
   }
 
   async alarm() {
+    if (this.isAlias) return;
     const kind =
       (await this.state.storage.get<string>("alarmKind")) ?? ALARM_IDLE;
 
@@ -356,6 +433,13 @@ export class RoomDurableObject implements DurableObject {
       peers,
       peerId: first?.id ?? null,
       peerPublicKey: first?.publicKey ?? null,
+    });
+
+    // Always tell joiner the current public invite code (may differ after rotates)
+    this.send(ws, {
+      v: PROTOCOL_VERSION,
+      type: "room_code",
+      publicCode: this.publicCode || this.roomId,
     });
 
     for (const peerWs of this.joinedPeers(ws)) {
@@ -520,6 +604,7 @@ export class RoomDurableObject implements DurableObject {
   }
 
   private async onSocketGone(ws: WebSocket) {
+    if (this.isAlias) return;
     const att = this.getAttachment(ws);
     if (!att) return;
     if (att.sessionToken.endsWith("__replaced")) return;
@@ -531,7 +616,6 @@ export class RoomDurableObject implements DurableObject {
     }
 
     const leftId = att.displayId;
-    // Clear so uniqueSessions drops this socket even if still listed briefly
     try {
       att.sessionToken = `${att.sessionToken}__gone`;
       this.setAttachment(ws, att);
@@ -556,7 +640,78 @@ export class RoomDurableObject implements DurableObject {
       await this.state.storage.put("emptySince", Date.now());
       await this.state.storage.setAlarm(Date.now() + LIMITS.reconnectGraceMs);
       await this.state.storage.put("alarmKind", "empty");
+    } else {
+      // Someone left but room still live → rotate invite code
+      await this.rotatePublicCode();
     }
+  }
+
+  /** Invalidate old invite code; publish a new one to remaining members. */
+  private async rotatePublicCode() {
+    if (!this.env?.ROOMS || this.isAlias || !this.roomId) return;
+
+    let newCode = generateRoomId();
+    for (let i = 0; i < 6; i++) {
+      if (newCode !== this.roomId && newCode !== this.publicCode) break;
+      newCode = generateRoomId();
+    }
+
+    // Register alias DO for the new public code → this room
+    try {
+      const aliasStub = this.env.ROOMS.get(
+        this.env.ROOMS.idFromName(newCode)
+      );
+      const res = await aliasStub.fetch("https://do/init-alias", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ targetRoomId: this.roomId }),
+      });
+      if (!res.ok) {
+        // Collision with an active room — try once more
+        newCode = generateRoomId();
+        const retry = this.env.ROOMS.get(this.env.ROOMS.idFromName(newCode));
+        const res2 = await retry.fetch("https://do/init-alias", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ targetRoomId: this.roomId }),
+        });
+        if (!res2.ok) return;
+      }
+    } catch {
+      return;
+    }
+
+    const oldPublic = this.publicCode;
+    // Clear previous alias (if it was not the primary DO name)
+    if (oldPublic && oldPublic !== this.roomId) {
+      try {
+        const oldAlias = this.env.ROOMS.get(
+          this.env.ROOMS.idFromName(oldPublic)
+        );
+        await oldAlias.fetch("https://do/clear-alias", { method: "POST" });
+      } catch {
+        /* ignore */
+      }
+    }
+
+    this.publicCode = newCode;
+    await this.state.storage.put("meta", {
+      kind: "room",
+      roomId: this.roomId,
+      publicCode: this.publicCode,
+      createdAt: this.createdAt,
+      maxParticipants: this.maxParticipants,
+    } satisfies RoomMeta);
+
+    this.broadcast(
+      null,
+      {
+        v: PROTOCOL_VERSION,
+        type: "room_code",
+        publicCode: this.publicCode,
+      },
+      false
+    );
   }
 
   private uniqueSessions(except?: WebSocket): Set<string> {
@@ -595,6 +750,21 @@ export class RoomDurableObject implements DurableObject {
         /* ignore */
       }
     }
+    // Drop current public alias if any
+    if (
+      this.env?.ROOMS &&
+      this.publicCode &&
+      this.publicCode !== this.roomId
+    ) {
+      try {
+        const oldAlias = this.env.ROOMS.get(
+          this.env.ROOMS.idFromName(this.publicCode)
+        );
+        await oldAlias.fetch("https://do/clear-alias", { method: "POST" });
+      } catch {
+        /* ignore */
+      }
+    }
     await this.state.storage.deleteAll();
     this.initialized = false;
   }
@@ -618,32 +788,35 @@ export class RoomDurableObject implements DurableObject {
     try {
       ws.send(JSON.stringify(msg));
     } catch {
-      /* ignore closed */
+      /* ignore */
     }
   }
 
   private broadcast(
-    except: WebSocket,
+    except: WebSocket | null,
     msg: ServerMessage,
-    onlyJoined: boolean
+    skipSender: boolean
   ) {
     for (const s of this.state.getWebSockets()) {
-      if (s === except) continue;
-      if (onlyJoined && !isLiveAttachment(this.getAttachment(s))) continue;
+      if (skipSender && except && s === except) continue;
+      if (!isLiveAttachment(this.getAttachment(s))) continue;
       this.send(s, msg);
     }
   }
 
   private getAttachment(ws: WebSocket): Attachment | null {
     try {
-      const a = ws.deserializeAttachment() as Attachment | null;
-      return a ?? null;
+      return (ws.deserializeAttachment() as Attachment | null) ?? null;
     } catch {
       return null;
     }
   }
 
   private setAttachment(ws: WebSocket, att: Attachment) {
-    ws.serializeAttachment(att);
+    try {
+      ws.serializeAttachment(att);
+    } catch {
+      /* ignore */
+    }
   }
 }

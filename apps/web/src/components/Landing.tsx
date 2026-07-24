@@ -198,6 +198,10 @@ export function Landing() {
               (no timer — hangus when the sender leaves).
             </li>
             <li>
+              When someone leaves, the <strong className="text-white">room code rotates</strong> so
+              old links stop working for new joiners.
+            </li>
+            <li>
               Not protected: compromised devices, sharing the room code with the
               wrong people.
             </li>

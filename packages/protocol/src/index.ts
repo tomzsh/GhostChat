@@ -104,6 +104,13 @@ export type ServerMessage =
       peerId: string;
       participantCount: number;
     }
+  /** Invite code rotated after a member left — remaining peers update share/QR. */
+  | {
+      v: typeof PROTOCOL_VERSION;
+      type: "room_code";
+      /** New public invite code (WS may still use stable internal room id). */
+      publicCode: string;
+    }
   | {
       v: typeof PROTOCOL_VERSION;
       type: "message";
@@ -162,7 +169,10 @@ export type ServerMessage =
 export type RoomStatusResponse =
   | {
       status: "ok";
+      /** Public invite code (may differ from internal DO id after rotation). */
       roomId: string;
+      /** Stable Durable Object / WS id — clients keep this for the socket. */
+      internalId?: string;
       participantCount: number;
       maxParticipants: number;
       full: boolean;

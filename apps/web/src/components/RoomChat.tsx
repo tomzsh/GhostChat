@@ -9,6 +9,7 @@ import {
   type RoomConnectionState,
 } from "@/hooks/useGhostRoom";
 import { canNativeShare, copyText, shareRoomCode } from "@/lib/share";
+import { CloseRoomModal } from "./CloseRoomModal";
 import { RoomQr } from "./RoomQr";
 import { SafetyNumber } from "./SafetyNumber";
 import { TerminalFrame } from "./TerminalFrame";
@@ -124,6 +125,7 @@ export function RoomChat({ roomId }: { roomId: string }) {
     state,
     myId,
     peerId,
+    publicCode,
     members,
     maxParticipants,
     participantCount,
@@ -143,6 +145,7 @@ export function RoomChat({ roomId }: { roomId: string }) {
   const [draft, setDraft] = useState("");
   const [feedback, setFeedback] = useState<Feedback>(null);
   const [closing, setClosing] = useState(false);
+  const [closeModalOpen, setCloseModalOpen] = useState(false);
   const [supportsShare, setSupportsShare] = useState(false);
   const [showQr, setShowQr] = useState(true);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -189,6 +192,18 @@ export function RoomChat({ roomId }: { roomId: string }) {
     feedbackTimer.current = setTimeout(() => setFeedback(null), 1600);
   }, []);
 
+  // After code rotation, surface QR again so host can re-share
+  const prevCodeRef = useRef(publicCode);
+  useEffect(() => {
+    if (prevCodeRef.current !== publicCode && publicCode) {
+      if (prevCodeRef.current) {
+        setShowQr(true);
+        flash("ok", `New code ${publicCode}`);
+      }
+      prevCodeRef.current = publicCode;
+    }
+  }, [publicCode, flash]);
+
   useEffect(() => {
     return () => {
       if (feedbackTimer.current) clearTimeout(feedbackTimer.current);
@@ -209,31 +224,38 @@ export function RoomChat({ roomId }: { roomId: string }) {
     [draft, sendMessage, notifyTyping]
   );
 
+  const shareCode = publicCode || roomId;
+
   const onCopyCode = useCallback(async () => {
-    const ok = await copyText(roomId);
+    const ok = await copyText(shareCode);
     flash(ok ? "ok" : "err", ok ? "Copied" : "Copy failed");
-  }, [roomId, flash]);
+  }, [shareCode, flash]);
 
   const onShare = useCallback(async () => {
-    const result = await shareRoomCode(roomId);
+    const result = await shareRoomCode(shareCode);
     if (result === "shared") flash("ok", "Shared");
     else if (result === "copied") flash("ok", "Copied");
     else if (result === "failed") flash("err", "Share failed");
-  }, [roomId, flash]);
+  }, [shareCode, flash]);
 
-  const onCloseRoom = useCallback(() => {
+  const openCloseModal = useCallback(() => {
     if (closing) return;
-    const needsConfirm = state !== "closed" && state !== "error";
-    if (
-      needsConfirm &&
-      !window.confirm("Close this room? Messages vanish from this device.")
-    ) {
+    if (state === "closed" || state === "error") {
+      setClosing(true);
+      leaveRoom();
+      router.replace("/");
       return;
     }
+    setCloseModalOpen(true);
+  }, [closing, state, leaveRoom, router]);
+
+  const confirmCloseRoom = useCallback(() => {
+    if (closing) return;
     setClosing(true);
+    setCloseModalOpen(false);
     leaveRoom();
     router.replace("/");
-  }, [closing, leaveRoom, router, state]);
+  }, [closing, leaveRoom, router]);
 
   const onDraftChange = useCallback(
     (value: string) => {
@@ -245,14 +267,15 @@ export function RoomChat({ roomId }: { roomId: string }) {
   );
 
   return (
+    <>
     <TerminalFrame
       variant="app"
-      title={roomId}
+      title={shareCode}
       hideFooterOnMobile
       headerRight={
         <button
           type="button"
-          onClick={onCloseRoom}
+          onClick={openCloseModal}
           disabled={closing}
           className="chip chip--danger"
           aria-label="Close room"
@@ -277,9 +300,9 @@ export function RoomChat({ roomId }: { roomId: string }) {
               type="button"
               onClick={onCopyCode}
               className="chip chip--active font-mono tracking-widest"
-              aria-label={`Copy room code ${roomId}`}
+              aria-label={`Copy room code ${shareCode}`}
             >
-              {roomId}
+              {shareCode}
             </button>
             <button type="button" onClick={onCopyCode} className="chip">
               copy
@@ -362,7 +385,16 @@ export function RoomChat({ roomId }: { roomId: string }) {
         {/* QR — compact, only when open */}
         {showQr ? (
           <div className="shrink-0 border-b border-ghost-border/40 px-2.5 py-2 sm:px-4">
-            <RoomQr roomId={roomId} compact className="mx-auto w-full max-w-[200px]" />
+            <RoomQr
+              roomId={shareCode}
+              compact
+              className="mx-auto w-full max-w-[200px]"
+            />
+            {publicCode !== roomId ? (
+              <p className="mt-1 text-center text-[10px] text-ghost-amber">
+                Code rotated · old invite invalid
+              </p>
+            ) : null}
           </div>
         ) : null}
 
@@ -467,5 +499,13 @@ export function RoomChat({ roomId }: { roomId: string }) {
         </form>
       </div>
     </TerminalFrame>
+
+    <CloseRoomModal
+      open={closeModalOpen}
+      busy={closing}
+      onCancel={() => setCloseModalOpen(false)}
+      onConfirm={confirmCloseRoom}
+    />
+    </>
   );
 }

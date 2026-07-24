@@ -5,13 +5,12 @@ import {
   LIMITS,
   clampMaxParticipants,
 } from "@ghostchat/shared";
-import { RoomDurableObject } from "./room";
+import { RoomDurableObject, type RoomEnv } from "./room";
 import { SlidingWindowLimiter, clientIp } from "./rateLimit";
 
 export { RoomDurableObject };
 
-export interface Env {
-  ROOMS: DurableObjectNamespace;
+export interface Env extends RoomEnv {
   PUBLIC_WS_ORIGIN: string;
 }
 
@@ -43,6 +42,79 @@ function rateLimited(): Response {
 
 function getRoomStub(env: Env, roomId: string): DurableObjectStub {
   return env.ROOMS.get(env.ROOMS.idFromName(roomId));
+}
+
+type StatusBody =
+  | {
+      status: "ok";
+      roomId: string;
+      internalId?: string;
+      participantCount: number;
+      maxParticipants: number;
+      full: boolean;
+    }
+  | { status: "alias"; targetRoomId: string }
+  | { status: "not_found" }
+  | { status: "full"; roomId: string; maxParticipants?: number };
+
+/**
+ * Resolve invite / internal code → live room.
+ * - `forInvite`: after rotation, internal id alone is NOT a valid share code
+ * - `forWs`: allow internal id so existing sockets/reconnects keep working
+ */
+async function resolveRoom(
+  env: Env,
+  code: string,
+  mode: "invite" | "ws"
+): Promise<{ body: StatusBody; status: number; internalId: string | null }> {
+  const first = await getRoomStub(env, code).fetch("https://do/status");
+  const body = (await first.json()) as StatusBody;
+
+  if (body.status === "alias") {
+    const target = body.targetRoomId;
+    const second = await getRoomStub(env, target).fetch("https://do/status");
+    const inner = (await second.json()) as StatusBody;
+    if (inner.status !== "ok") {
+      return { body: { status: "not_found" }, status: 404, internalId: null };
+    }
+    return {
+      body: {
+        ...inner,
+        roomId: inner.roomId,
+        internalId: inner.internalId ?? target,
+      },
+      status: 200,
+      internalId: inner.internalId ?? target,
+    };
+  }
+
+  if (body.status === "not_found") {
+    return { body, status: 404, internalId: null };
+  }
+
+  if (body.status === "ok") {
+    const internalId = body.internalId ?? code;
+    const publicCode = body.roomId;
+    // Stale internal-as-invite after rotation (share/QR must use publicCode)
+    if (
+      mode === "invite" &&
+      code === internalId &&
+      publicCode !== internalId
+    ) {
+      return { body: { status: "not_found" }, status: 404, internalId: null };
+    }
+    // Unknown code that somehow hit a room DO
+    if (code !== publicCode && code !== internalId) {
+      return { body: { status: "not_found" }, status: 404, internalId: null };
+    }
+    return {
+      body: { ...body, internalId },
+      status: 200,
+      internalId,
+    };
+  }
+
+  return { body, status: 200, internalId: null };
 }
 
 export default {
@@ -96,10 +168,8 @@ export default {
       if (!isValidRoomId(roomId)) {
         return json({ status: "not_found" }, 404);
       }
-      const res = await getRoomStub(env, roomId).fetch("https://do/status");
-      const body = await res.json();
-      const status = (body as { status?: string }).status;
-      return json(body, status === "not_found" ? 404 : 200);
+      const { body, status } = await resolveRoom(env, roomId, "invite");
+      return json(body, status);
     }
 
     const wsMatch = path.match(/^\/ws\/([A-Za-z0-9]+)$/);
@@ -115,14 +185,21 @@ export default {
       if (!isValidRoomId(roomId)) {
         return json({ error: "room_not_found" }, 404);
       }
-      const stub = getRoomStub(env, roomId);
+
+      // Resolve alias / rotated codes to stable internal DO (allow internal id)
+      const resolved = await resolveRoom(env, roomId, "ws");
+      if (!resolved.internalId || resolved.body.status === "not_found") {
+        return json({ error: "room_not_found" }, 404);
+      }
+
+      const stub = getRoomStub(env, resolved.internalId);
       const doUrl = new URL(request.url);
       doUrl.pathname = "/ws";
-      return stub.fetch(new Request(doUrl.toString(), request));
+      return stub.fetch(doUrl.toString(), request);
     }
 
-    if (path === "/" || path === "/health") {
-      return json({ ok: true, service: "ghostchat" });
+    if (path === "/api/health" && request.method === "GET") {
+      return json({ ok: true, service: "ghostchat-worker" });
     }
 
     return json({ error: "not_found" }, 404);

@@ -153,6 +153,25 @@ body {
   max-width: 100%;
 }
 
+/* Close-room modal */
+.close-modal {
+  animation: close-modal-in 0.2s ease-out;
+}
+.close-modal__art {
+  text-shadow: 0 0 10px rgba(51, 255, 102, 0.25);
+  min-height: 5.5rem;
+}
+@keyframes close-modal-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
 @keyframes typing-glow {
   from {
     filter: brightness(0.95);
