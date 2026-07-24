@@ -11,6 +11,58 @@ const workerOrigin = (
   "http://127.0.0.1:8787"
 ).replace(/\/$/, "");
 
+const wsOrigin = (
+  process.env.NEXT_PUBLIC_WS_URL ||
+  process.env.NEXT_PUBLIC_API_URL?.replace(/^http/i, "ws") ||
+  "ws://127.0.0.1:8787"
+).replace(/\/$/, "");
+
+/** Browser connect targets: same-origin REST + absolute WS (and wss twin). */
+const cspConnectSrc = [
+  "'self'",
+  workerOrigin,
+  wsOrigin,
+  wsOrigin.replace(/^ws:/i, "http:").replace(/^wss:/i, "https:"),
+  wsOrigin.replace(/^http:/i, "ws:").replace(/^https:/i, "wss:"),
+]
+  .filter(Boolean)
+  .filter((v, i, a) => a.indexOf(v) === i)
+  .join(" ");
+
+const securityHeaders: { key: string; value: string }[] = [
+  { key: "X-Content-Type-Options", value: "nosniff" },
+  { key: "X-Frame-Options", value: "DENY" },
+  { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+  {
+    key: "Permissions-Policy",
+    value: "camera=(), microphone=(), geolocation=(), payment=()",
+  },
+  {
+    key: "Content-Security-Policy",
+    value: [
+      "default-src 'self'",
+      // Next.js needs inline for hydration / font CSS in some builds
+      "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+      "style-src 'self' 'unsafe-inline'",
+      "img-src 'self' data: blob:",
+      "font-src 'self' data:",
+      `connect-src ${cspConnectSrc}`,
+      "media-src 'self' blob:",
+      "worker-src 'self' blob:",
+      "object-src 'none'",
+      "base-uri 'self'",
+      "form-action 'self'",
+      "frame-ancestors 'none'",
+      "upgrade-insecure-requests",
+    ].join("; "),
+  },
+  // HSTS is also set by Vercel; keep explicit for non-Vercel hosts
+  {
+    key: "Strict-Transport-Security",
+    value: "max-age=63072000; includeSubDomains; preload",
+  },
+];
+
 const nextConfig: NextConfig = {
   transpilePackages: [
     "@ghostchat/crypto",
@@ -27,6 +79,15 @@ const nextConfig: NextConfig = {
 
   // Hide X-Powered-By
   poweredByHeader: false,
+
+  async headers() {
+    return [
+      {
+        source: "/:path*",
+        headers: securityHeaders,
+      },
+    ];
+  },
 
   // Proxy REST to the worker so the browser can call /api/* same-origin.
   // WebSocket still connects to the worker host directly (see getWsUrl).

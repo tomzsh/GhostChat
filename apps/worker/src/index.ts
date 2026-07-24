@@ -20,6 +20,18 @@ const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
+/** Baseline security headers for Worker JSON / OPTIONS responses. */
+const SECURITY_HEADERS: Record<string, string> = {
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+  "Referrer-Policy": "no-referrer",
+  "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=()",
+  "Cross-Origin-Resource-Policy": "cross-origin",
+  // Workers are always HTTPS on *.workers.dev
+  "Strict-Transport-Security":
+    "max-age=63072000; includeSubDomains; preload",
+};
+
 const createLimiter = new SlidingWindowLimiter(
   LIMITS.maxCreatesPerMinute,
   LIMITS.rateLimitWindowMs
@@ -35,7 +47,7 @@ function json(data: unknown, status = 200): Response {
     headers: {
       "Content-Type": "application/json; charset=utf-8",
       "Cache-Control": "no-store",
-      "X-Content-Type-Options": "nosniff",
+      ...SECURITY_HEADERS,
       ...CORS_HEADERS,
     },
   });
@@ -168,7 +180,10 @@ async function resolveRoom(
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: CORS_HEADERS });
+      return new Response(null, {
+        status: 204,
+        headers: { ...SECURITY_HEADERS, ...CORS_HEADERS },
+      });
     }
 
     const url = new URL(request.url);
@@ -223,7 +238,12 @@ export default {
       if (!joinLimiter.allow(`join:${ip}`)) {
         return new Response(JSON.stringify({ error: "rate_limited" }), {
           status: 429,
-          headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+          headers: {
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": "no-store",
+            ...SECURITY_HEADERS,
+            ...CORS_HEADERS,
+          },
         });
       }
 
