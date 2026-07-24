@@ -112,12 +112,57 @@ describe("app image payload", () => {
   });
 });
 
+describe("app file payload", () => {
+  it("splits and reassembles chunked files", async () => {
+    const {
+      encodeAppFileChunks,
+      decodeAppPayload,
+      createFileTransferAssembler,
+    } = await import("./index.ts");
+    const bytes = new Uint8Array(40_000);
+    for (let i = 0; i < bytes.length; i++) bytes[i] = (i * 7) & 0xff;
+    const frames = encodeAppFileChunks(
+      "m_testfile1",
+      "application/pdf",
+      "doc.pdf",
+      bytes
+    );
+    assert.ok(frames.length >= 2);
+    const asm = createFileTransferAssembler();
+    let complete: ReturnType<ReturnType<typeof createFileTransferAssembler>["ingest"]> | null =
+      null;
+    for (const frame of frames) {
+      const decoded = decodeAppPayload(frame);
+      assert.equal(decoded.kind, "file_part");
+      if (decoded.kind !== "file_part") continue;
+      complete = asm.ingest({
+        id: decoded.id,
+        i: decoded.i,
+        n: decoded.n,
+        mime: decoded.mime,
+        name: decoded.name,
+        len: decoded.len,
+        data: decoded.data,
+      });
+    }
+    assert.ok(complete);
+    assert.equal(complete!.status, "complete");
+    if (complete!.status === "complete") {
+      assert.equal(complete.mime, "application/pdf");
+      assert.equal(complete.name, "doc.pdf");
+      assert.deepEqual(complete.bytes, bytes);
+    }
+  });
+});
+
 describe("app emoji payload", () => {
   it("round-trips emoji encode/decode", async () => {
     const { encodeAppEmoji, decodeAppPayload, isAsciiEmojiId } = await import(
       "./index.ts"
     );
     assert.ok(isAsciiEmojiId("wave"));
+    assert.ok(isAsciiEmojiId("rocket"));
+    assert.ok(isAsciiEmojiId("matrix"));
     const wire = encodeAppEmoji("wave");
     const parsed = decodeAppPayload(wire);
     assert.equal(parsed.kind, "emoji");

@@ -24,8 +24,10 @@ import {
   type PeerInfo,
 } from "@ghostchat/protocol";
 import {
+  createFileTransferAssembler,
   decodeAppPayload,
   encodeAppEmoji,
+  encodeAppFileChunks,
   encodeAppImageChunks,
   generateMessageId,
   ImageTransferAssembler,
@@ -61,11 +63,16 @@ export type ChatMessage = {
   ttlMode: TtlMode;
   receivedAt: number;
   burning?: boolean;
-  kind?: "text" | "image" | "emoji";
+  kind?: "text" | "image" | "file" | "emoji";
   /** Object URL for decrypted/local image (revoke on burn). */
   imageUrl?: string;
   imageName?: string;
   imageMime?: string;
+  /** Object URL for decrypted file download (revoke on burn). */
+  fileUrl?: string;
+  fileName?: string;
+  fileMime?: string;
+  fileSize?: number;
   /** Animated ASCII emote id */
   emojiId?: string;
 };
@@ -159,8 +166,9 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
   const ttlModeRef = useRef(ttlMode);
   const myIdRef = useRef(myId);
   const lastTypingSent = useRef(false);
-  /** Reassemble multi-frame E2EE image transfers. */
+  /** Reassemble multi-frame E2EE image / file transfers. */
   const imageAssembler = useRef(new ImageTransferAssembler());
+  const fileAssembler = useRef(createFileTransferAssembler());
 
   // Keep refs in sync — roomIdRef stays on join key (not rotated public code)
   roomIdRef.current = joinIdRef.current;
@@ -317,6 +325,13 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
           /* ignore */
         }
       }
+      if (m.fileUrl) {
+        try {
+          URL.revokeObjectURL(m.fileUrl);
+        } catch {
+          /* ignore */
+        }
+      }
     }
   }, []);
 
@@ -460,6 +475,45 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     [scheduleTtl]
   );
 
+  const appendFileMessage = useCallback(
+    (
+      meta: {
+        id: string;
+        from: string;
+        mine: boolean;
+        ttlMode: TtlMode;
+      },
+      file: { mime: string; name: string; bytes: Uint8Array }
+    ) => {
+      const blob = new Blob([file.bytes as BlobPart], {
+        type: file.mime || "application/octet-stream",
+      });
+      const fileUrl = URL.createObjectURL(blob);
+      const msg: ChatMessage = {
+        id: meta.id,
+        from: meta.from,
+        text: "",
+        mine: meta.mine,
+        ttlMode: meta.ttlMode,
+        receivedAt: Date.now(),
+        kind: "file",
+        fileUrl,
+        fileName: file.name,
+        fileMime: file.mime,
+        fileSize: file.bytes.byteLength,
+      };
+      setMessages((prev) => {
+        if (prev.some((m) => m.id === meta.id)) {
+          URL.revokeObjectURL(fileUrl);
+          return prev;
+        }
+        return [...prev, msg];
+      });
+      scheduleTtl(meta.id, meta.ttlMode, meta.mine);
+    },
+    [scheduleTtl]
+  );
+
   const appendChatMessage = useCallback(
     (
       rawText: string,
@@ -472,10 +526,13 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     ) => {
       const parsed = decodeAppPayload(rawText);
       // Chunks are assembled separately — never show partial frames as text
-      if (parsed.kind === "image_part") return;
+      if (parsed.kind === "image_part" || parsed.kind === "file_part") return;
       let msg: ChatMessage;
       if (parsed.kind === "image") {
         appendImageMessage(meta, parsed);
+        return;
+      } else if (parsed.kind === "file") {
+        appendFileMessage(meta, parsed);
         return;
       } else if (parsed.kind === "emoji") {
         msg = {
@@ -505,7 +562,7 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
       });
       scheduleTtl(meta.id, meta.ttlMode, meta.mine);
     },
-    [scheduleTtl, appendImageMessage]
+    [scheduleTtl, appendImageMessage, appendFileMessage]
   );
 
   const onServerRef = useRef<(msg: ServerMessage) => void>(() => {});
@@ -749,7 +806,31 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
                   }
                 );
               }
-              // pending / error: stay silent (ephemeral transfer)
+            } else if (parsed.kind === "file_part") {
+              const progress = fileAssembler.current.ingest({
+                id: parsed.id,
+                i: parsed.i,
+                n: parsed.n,
+                mime: parsed.mime,
+                name: parsed.name,
+                len: parsed.len,
+                data: parsed.data,
+              });
+              if (progress.status === "complete") {
+                appendFileMessage(
+                  {
+                    id: progress.id,
+                    from: msg.from,
+                    mine: false,
+                    ttlMode: msg.ttlMode,
+                  },
+                  {
+                    mime: progress.mime,
+                    name: progress.name,
+                    bytes: progress.bytes,
+                  }
+                );
+              }
             } else {
               appendChatMessage(result.text, {
                 id: msg.messageId,
@@ -830,6 +911,7 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     pendingKp.current.clear();
     addingPeer.current.clear();
     imageAssembler.current.clear();
+    fileAssembler.current.clear();
 
     const initialId = joinIdRef.current;
     const cached = getCachedMlsSession(initialId);
@@ -1025,14 +1107,78 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     [sendAppPayload]
   );
 
+  /** Send paced E2EE MLS chunk frames; returns transferId on success. */
+  const sendChunkedFrames = useCallback(
+    async (
+      frames: string[],
+      transferId: string,
+      label: string
+    ): Promise<boolean> => {
+      const mode = ttlModeRef.current;
+      try {
+        for (let i = 0; i < frames.length; i++) {
+          const frame = frames[i]!;
+          const wireId = i === 0 ? transferId : `${transferId}_${i}`;
+          const ok = await enqueueMls(async () => {
+            const session = mlsRef.current;
+            const sock = wsRef.current;
+            if (!session?.state || !sock || sock.readyState !== WebSocket.OPEN) {
+              return false;
+            }
+            const enc = await encryptApp(session, frame);
+            persistMls(enc.session);
+            sock.send(
+              JSON.stringify({
+                v: PROTOCOL_VERSION,
+                type: "message",
+                ciphertext: enc.ciphertextB64,
+                nonce: MLS_NONCE_MARKER,
+                ttlMode: mode,
+                messageId: wireId,
+              })
+            );
+            return true;
+          });
+          if (!ok) {
+            setError(`Disconnected while sending ${label}`);
+            return false;
+          }
+          if (i < frames.length - 1) {
+            await new Promise((r) =>
+              setTimeout(r, LIMITS.imageChunkSendGapMs)
+            );
+          }
+        }
+        setMeTyping(false);
+        lastTypingSent.current = false;
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          wsRef.current.send(
+            JSON.stringify({
+              v: PROTOCOL_VERSION,
+              type: "typing",
+              state: false,
+            })
+          );
+        }
+        setError(null);
+        return true;
+      } catch (e) {
+        setError(
+          e instanceof Error ? e.message : `Failed to send ${label}`
+        );
+        return false;
+      }
+    },
+    [persistMls, enqueueMls]
+  );
+
   /**
    * Send a pre-compressed image as paced E2EE MLS chunks (stable on WS).
    * Caller must compress first (see compressImageForSend).
    */
   const sendImage = useCallback(
     async (bytes: Uint8Array, mime: string, name: string) => {
-      const ws = wsRef.current;
-      if (!ws || ws.readyState !== WebSocket.OPEN) {
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
         setError("Not connected — wait a moment or refresh");
         return false;
       }
@@ -1059,67 +1205,63 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
         return false;
       }
 
-      try {
-        for (let i = 0; i < frames.length; i++) {
-          const frame = frames[i]!;
-          const wireId = i === 0 ? transferId : `${transferId}_${i}`;
-          const ok = await enqueueMls(async () => {
-            const session = mlsRef.current;
-            const sock = wsRef.current;
-            if (!session?.state || !sock || sock.readyState !== WebSocket.OPEN) {
-              return false;
-            }
-            const enc = await encryptApp(session, frame);
-            persistMls(enc.session);
-            sock.send(
-              JSON.stringify({
-                v: PROTOCOL_VERSION,
-                type: "message",
-                ciphertext: enc.ciphertextB64,
-                nonce: MLS_NONCE_MARKER,
-                ttlMode: mode,
-                messageId: wireId,
-              })
-            );
-            return true;
-          });
-          if (!ok) {
-            setError("Disconnected while sending image");
-            return false;
-          }
-          // Pace under server maxMessagesPerSecond
-          if (i < frames.length - 1) {
-            await new Promise((r) =>
-              setTimeout(r, LIMITS.imageChunkSendGapMs)
-            );
-          }
-        }
+      const ok = await sendChunkedFrames(frames, transferId, "image");
+      if (!ok) return false;
+      const fromId = myIdRef.current ?? "You";
+      appendImageMessage(
+        { id: transferId, from: fromId, mine: true, ttlMode: mode },
+        { mime, name, bytes }
+      );
+      return true;
+    },
+    [appendImageMessage, sendChunkedFrames]
+  );
 
-        // Show locally once all chunks are out (same transfer id peers will use)
-        const fromId = myIdRef.current ?? "You";
-        appendImageMessage(
-          { id: transferId, from: fromId, mine: true, ttlMode: mode },
-          { mime, name, bytes }
-        );
-        setMeTyping(false);
-        lastTypingSent.current = false;
-        if (wsRef.current?.readyState === WebSocket.OPEN) {
-          wsRef.current.send(
-            JSON.stringify({
-              v: PROTOCOL_VERSION,
-              type: "typing",
-              state: false,
-            })
-          );
-        }
-        setError(null);
-        return true;
-      } catch (e) {
-        setError(e instanceof Error ? e.message : "Failed to send image");
+  /**
+   * Send an arbitrary file (≤1MB) as paced E2EE MLS chunks.
+   * Peer can download via object URL in chat.
+   */
+  const sendFile = useCallback(
+    async (bytes: Uint8Array, mime: string, name: string) => {
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+        setError("Not connected — wait a moment or refresh");
         return false;
       }
+      if (!mlsRef.current?.state) {
+        setError("Encryption not ready — waiting for MLS group");
+        return false;
+      }
+      if (membersRef.current.length === 0) {
+        setError("Waiting for at least one peer to join");
+        return false;
+      }
+      if (bytes.byteLength > LIMITS.maxFileBytes) {
+        setError(
+          `File too large (max ${Math.round(LIMITS.maxFileBytes / 1024)}KB)`
+        );
+        return false;
+      }
+
+      const transferId = generateMessageId();
+      const mode = ttlModeRef.current;
+      let frames: string[];
+      try {
+        frames = encodeAppFileChunks(transferId, mime, name, bytes);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Failed to prepare file");
+        return false;
+      }
+
+      const ok = await sendChunkedFrames(frames, transferId, "file");
+      if (!ok) return false;
+      const fromId = myIdRef.current ?? "You";
+      appendFileMessage(
+        { id: transferId, from: fromId, mine: true, ttlMode: mode },
+        { mime, name, bytes }
+      );
+      return true;
     },
-    [appendImageMessage, persistMls, enqueueMls]
+    [appendFileMessage, sendChunkedFrames]
   );
 
   /** Send an animated ASCII emote by id. */
@@ -1175,6 +1317,7 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     clearBurnTimers();
     clearKpRetries();
     imageAssembler.current.clear();
+    fileAssembler.current.clear();
     if (typingTimer.current) clearTimeout(typingTimer.current);
     const rid = roomIdRef.current;
     clearRoomSession(rid);
@@ -1239,6 +1382,7 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     safetyNumber,
     sendMessage,
     sendImage,
+    sendFile,
     sendEmoji,
     notifyTyping,
     leaveRoom,

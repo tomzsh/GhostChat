@@ -98,9 +98,23 @@ function statusLine(
   }
 }
 
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+}
+
 const MessageRow = memo(function MessageRow({ m }: { m: ChatMessage }) {
   const isImage = m.kind === "image" && m.imageUrl;
+  const isFile = m.kind === "file" && m.fileUrl;
   const isEmoji = m.kind === "emoji" && m.emojiId;
+  const kindTag = isImage
+    ? " · img"
+    : isFile
+      ? " · file"
+      : isEmoji
+        ? " · ascii"
+        : "";
   return (
     <div
       className={`rounded px-2 py-1.5 ${
@@ -110,7 +124,7 @@ const MessageRow = memo(function MessageRow({ m }: { m: ChatMessage }) {
       <div className="mb-0.5 flex items-baseline justify-between gap-2">
         <span className="text-[10px] text-ghost-dim sm:text-[11px]">
           {m.mine ? "you" : m.from}
-          {isImage ? " · img" : isEmoji ? " · ascii" : ""}
+          {kindTag}
         </span>
         <span className="shrink-0 text-[9px] text-ghost-dim/50">
           burn:{ttlShort(m.ttlMode)}
@@ -135,6 +149,26 @@ const MessageRow = memo(function MessageRow({ m }: { m: ChatMessage }) {
               {m.imageName}
             </span>
           ) : null}
+        </a>
+      ) : isFile ? (
+        <a
+          href={m.fileUrl}
+          download={m.fileName || "file"}
+          className="flex min-h-11 items-center gap-2 rounded border border-ghost-border/70 bg-ghost-bg/80 px-3 py-2 text-ghost-green transition hover:border-ghost-green/50"
+        >
+          <span className="font-mono text-xs text-ghost-dim" aria-hidden>
+            [file]
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-[13px] font-medium sm:text-sm">
+              {m.fileName || "download"}
+            </span>
+            <span className="block text-[10px] text-ghost-dim">
+              {formatBytes(m.fileSize ?? 0)}
+              {m.fileMime ? ` · ${m.fileMime}` : ""}
+              {" · tap to download"}
+            </span>
+          </span>
         </a>
       ) : isEmoji ? (
         <div className="py-1">
@@ -174,6 +208,7 @@ export function RoomChat({ roomId }: { roomId: string }) {
     safetyNumber,
     sendMessage,
     sendImage,
+    sendFile,
     sendEmoji,
     notifyTyping,
     leaveRoom,
@@ -187,6 +222,7 @@ export function RoomChat({ roomId }: { roomId: string }) {
   const [supportsShare, setSupportsShare] = useState(false);
   const [showQr, setShowQr] = useState(true);
   const [sendingImage, setSendingImage] = useState(false);
+  const [sendingFile, setSendingFile] = useState(false);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [presenceEvent, setPresenceEvent] = useState<PresenceEvent | null>(
     null
@@ -196,6 +232,7 @@ export function RoomChat({ roomId }: { roomId: string }) {
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const anyFileInputRef = useRef<HTMLInputElement>(null);
   const feedbackTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const ttlMeta = TTL_OPTIONS.find((o) => o.value === ttlMode);
@@ -348,9 +385,14 @@ export function RoomChat({ roomId }: { roomId: string }) {
   );
 
   const onPickImage = useCallback(() => {
-    if (!canSend || sendingImage) return;
+    if (!canSend || sendingImage || sendingFile) return;
     fileInputRef.current?.click();
-  }, [canSend, sendingImage]);
+  }, [canSend, sendingImage, sendingFile]);
+
+  const onPickFile = useCallback(() => {
+    if (!canSend || sendingImage || sendingFile) return;
+    anyFileInputRef.current?.click();
+  }, [canSend, sendingImage, sendingFile]);
 
   const onImageSelected = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -378,6 +420,36 @@ export function RoomChat({ roomId }: { roomId: string }) {
       }
     },
     [canSend, sendImage, flash]
+  );
+
+  const onFileSelected = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      e.target.value = "";
+      if (!file || !canSend) return;
+      setSendingFile(true);
+      try {
+        if (file.size > 1024 * 1024) {
+          throw new Error("File max 1MB");
+        }
+        const buf = new Uint8Array(await file.arrayBuffer());
+        const ok = await sendFile(
+          buf,
+          file.type || "application/octet-stream",
+          file.name || "file"
+        );
+        if (ok) flash("ok", "File sent");
+        else flash("err", "Send failed");
+      } catch (err) {
+        flash(
+          "err",
+          err instanceof Error ? err.message : "File send failed"
+        );
+      } finally {
+        setSendingFile(false);
+      }
+    },
+    [canSend, sendFile, flash]
   );
 
   const onPickEmoji = useCallback(
@@ -615,6 +687,12 @@ export function RoomChat({ roomId }: { roomId: string }) {
               className="hidden"
               onChange={onImageSelected}
             />
+            <input
+              ref={anyFileInputRef}
+              type="file"
+              className="hidden"
+              onChange={onFileSelected}
+            />
             <button
               type="button"
               onClick={() => setEmojiOpen((v) => !v)}
@@ -631,12 +709,22 @@ export function RoomChat({ roomId }: { roomId: string }) {
             <button
               type="button"
               onClick={onPickImage}
-              disabled={!canSend || sendingImage}
+              disabled={!canSend || sendingImage || sendingFile}
               className="chip !min-h-11 shrink-0 touch-manipulation px-2.5 text-[12px] disabled:opacity-40"
               aria-label="Send image"
               title="Compress + send image (E2EE, ≤1MB, chunked)"
             >
               {sendingImage ? "…" : "img"}
+            </button>
+            <button
+              type="button"
+              onClick={onPickFile}
+              disabled={!canSend || sendingImage || sendingFile}
+              className="chip !min-h-11 shrink-0 touch-manipulation px-2.5 text-[12px] disabled:opacity-40"
+              aria-label="Send file"
+              title="Send file (E2EE, ≤1MB, downloadable)"
+            >
+              {sendingFile ? "…" : "file"}
             </button>
             <input
               ref={inputRef}
@@ -654,7 +742,9 @@ export function RoomChat({ roomId }: { roomId: string }) {
             />
             <button
               type="submit"
-              disabled={!canSend || !draft.trim() || sendingImage}
+              disabled={
+                !canSend || !draft.trim() || sendingImage || sendingFile
+              }
               className="min-h-11 min-w-[4.25rem] shrink-0 touch-manipulation bg-ghost-green px-3 text-sm font-semibold text-black disabled:opacity-40 sm:min-w-[5rem]"
             >
               Send

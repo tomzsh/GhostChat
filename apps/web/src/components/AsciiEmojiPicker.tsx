@@ -34,7 +34,7 @@ export function AsciiEmojiPicker({ open, disabled, onPick, onClose }: Props) {
           close
         </button>
       </div>
-      <div className="grid max-h-40 grid-cols-3 gap-1.5 overflow-y-auto sm:grid-cols-4">
+      <div className="grid max-h-52 grid-cols-3 gap-1.5 overflow-y-auto sm:max-h-64 sm:grid-cols-4 md:grid-cols-5">
         {items.map((e) => (
           <button
             key={e.id}
@@ -42,11 +42,11 @@ export function AsciiEmojiPicker({ open, disabled, onPick, onClose }: Props) {
             role="option"
             disabled={disabled}
             onClick={() => onPick(e.id)}
-            className="flex min-h-[4.5rem] flex-col items-center justify-center rounded border border-ghost-border/60 bg-black/40 px-1 py-1.5 touch-manipulation hover:border-ghost-green/50 disabled:opacity-40"
+            className="flex min-h-[4.25rem] flex-col items-center justify-center rounded border border-ghost-border/60 bg-black/40 px-1 py-1.5 touch-manipulation hover:border-ghost-green/50 disabled:opacity-40"
             title={e.label}
           >
             <AnimatedAsciiEmoji id={e.id} className="scale-90" />
-            <span className="mt-1 font-mono text-[9px] text-ghost-dim">
+            <span className="mt-1 truncate font-mono text-[9px] text-ghost-dim">
               {e.chip}
             </span>
           </button>

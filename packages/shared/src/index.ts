@@ -58,17 +58,19 @@ export const LIMITS = {
   maxMlsPayloadBytes: 96 * 1024,
   /** Max compressed image bytes before E2EE (JPEG/WebP). */
   maxImageBytes: 1024 * 1024,
+  /** Max ephemeral file bytes before E2EE (any type, downloadable). */
+  maxFileBytes: 1024 * 1024,
   /** Longest edge when client-resizing images before send. */
   maxImageEdgePx: 1920,
   /**
-   * Raw binary bytes per image chunk (before base64 + MLS).
+   * Raw binary bytes per blob chunk (before base64 + MLS).
    * Keeps each WS frame small for stable relay under rate limits.
    */
   imageChunkBytes: 24 * 1024,
-  /** Drop incomplete image transfers after this many ms. */
+  /** Drop incomplete image/file transfers after this many ms. */
   imageTransferTtlMs: 90_000,
   /**
-   * Min delay between image chunk WS sends (ms).
+   * Min delay between blob chunk WS sends (ms).
    * Stays under maxMessagesPerSecond with headroom.
    */
   imageChunkSendGapMs: 220,
@@ -137,6 +139,8 @@ export function isValidTtlMode(mode: string): mode is TtlMode {
 export const APP_IMAGE_PREFIX = "\u0001GCIMG1:" as const;
 /** Chunked image frames (stable multi-message transfer). */
 export const APP_IMAGE_CHUNK_PREFIX = "\u0001GCIMGC1:" as const;
+/** Chunked file frames (downloadable, any mime ≤ maxFileBytes). */
+export const APP_FILE_CHUNK_PREFIX = "\u0001GCFILE1:" as const;
 export const APP_EMOJI_PREFIX = "\u0001GCEMO1:" as const;
 
 /** Built-in animated ASCII emote ids (frames live on clients). */
@@ -153,6 +157,39 @@ export const ASCII_EMOJI_IDS = [
   "cry",
   "cool",
   "think",
+  // v2.5+ expanded set
+  "rocket",
+  "matrix",
+  "glitch",
+  "dance",
+  "shrug",
+  "rage",
+  "robot",
+  "cat",
+  "star",
+  "moon",
+  "rain",
+  "boom",
+  "ninja",
+  "alien",
+  "bongo",
+  "spinner",
+  "ok",
+  "nope",
+  "sparkle",
+  "eyes",
+  "clap",
+  "facepalm",
+  "wink",
+  "sleepy",
+  "money",
+  "pizza",
+  "hacker",
+  "terminal",
+  "love",
+  "zombie",
+  "wizard",
+  "keyboard",
 ] as const;
 
 export type AsciiEmojiId = (typeof ASCII_EMOJI_IDS)[number];
@@ -170,6 +207,12 @@ export type DecodedAppPayload =
       bytes: Uint8Array;
     }
   | {
+      kind: "file";
+      mime: string;
+      name: string;
+      bytes: Uint8Array;
+    }
+  | {
       kind: "image_part";
       /** Transfer id (shared across chunks; used as final chat message id). */
       id: string;
@@ -180,6 +223,16 @@ export type DecodedAppPayload =
       mime?: string;
       name?: string;
       /** Total image byte length (part 0). */
+      len?: number;
+      data: Uint8Array;
+    }
+  | {
+      kind: "file_part";
+      id: string;
+      i: number;
+      n: number;
+      mime?: string;
+      name?: string;
       len?: number;
       data: Uint8Array;
     }
@@ -207,6 +260,18 @@ function safeImageMime(mime: string): "image/jpeg" | "image/png" | "image/webp" 
 
 function safeImageName(name: string): string {
   return (name || "image").slice(0, 80).replace(/[^\w.\-()+ ]/g, "_");
+}
+
+function safeFileMime(mime: string): string {
+  if (!mime || mime.length > 120) return "application/octet-stream";
+  if (!/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/i.test(mime)) {
+    return "application/octet-stream";
+  }
+  return mime.slice(0, 120);
+}
+
+function safeFileName(name: string): string {
+  return (name || "file").slice(0, 120).replace(/[^\w.\-()+ ]/g, "_") || "file";
 }
 
 /** Pack compressed image bytes into a single MLS application plaintext (legacy). */
@@ -294,13 +359,34 @@ type PendingTransfer = {
   updatedAt: number;
 };
 
-/** Reassemble chunked image frames (in-memory, ephemeral). */
+type AssemblerMode = "image" | "file";
+
+/**
+ * Reassemble chunked image or file frames (in-memory, ephemeral).
+ * Use mode `"file"` for downloadable blobs (any mime ≤ maxFileBytes).
+ */
 export class ImageTransferAssembler {
   private pending = new Map<string, PendingTransfer>();
   private readonly ttlMs: number;
+  private readonly maxBytes: number;
+  private readonly mode: AssemblerMode;
 
-  constructor(ttlMs: number = LIMITS.imageTransferTtlMs) {
-    this.ttlMs = ttlMs;
+  constructor(
+    ttlMsOrOpts:
+      | number
+      | { ttlMs?: number; maxBytes?: number; mode?: AssemblerMode } = LIMITS.imageTransferTtlMs
+  ) {
+    if (typeof ttlMsOrOpts === "number") {
+      this.ttlMs = ttlMsOrOpts;
+      this.maxBytes = LIMITS.maxImageBytes;
+      this.mode = "image";
+    } else {
+      this.ttlMs = ttlMsOrOpts.ttlMs ?? LIMITS.imageTransferTtlMs;
+      this.mode = ttlMsOrOpts.mode ?? "image";
+      this.maxBytes =
+        ttlMsOrOpts.maxBytes ??
+        (this.mode === "file" ? LIMITS.maxFileBytes : LIMITS.maxImageBytes);
+    }
   }
 
   clear() {
@@ -315,7 +401,7 @@ export class ImageTransferAssembler {
   }
 
   /**
-   * Ingest one decoded image_part. Returns progress / complete image.
+   * Ingest one decoded image_part / file_part. Returns progress / complete blob.
    */
   ingest(part: {
     id: string;
@@ -370,9 +456,9 @@ export class ImageTransferAssembler {
       }
       total += p.byteLength;
     }
-    if (total > LIMITS.maxImageBytes * 1.1) {
+    if (total > this.maxBytes * 1.1) {
       this.pending.delete(id);
-      return { status: "error", id, reason: "image too large" };
+      return { status: "error", id, reason: "blob too large" };
     }
     if (t.len !== undefined && t.len !== total) {
       this.pending.delete(id);
@@ -387,6 +473,15 @@ export class ImageTransferAssembler {
       offset += p.byteLength;
     }
     this.pending.delete(id);
+    if (this.mode === "file") {
+      return {
+        status: "complete",
+        id,
+        mime: safeFileMime(t.mime || "application/octet-stream"),
+        name: safeFileName(t.name || "file"),
+        bytes,
+      };
+    }
     return {
       status: "complete",
       id,
@@ -395,6 +490,58 @@ export class ImageTransferAssembler {
       bytes,
     };
   }
+}
+
+/** Assembler for downloadable file transfers. */
+export function createFileTransferAssembler(): ImageTransferAssembler {
+  return new ImageTransferAssembler({
+    mode: "file",
+    maxBytes: LIMITS.maxFileBytes,
+  });
+}
+
+/**
+ * Split a file into small MLS plaintexts for stable multi-frame send.
+ * Part 0 carries mime + name; all parts share `transferId`.
+ */
+export function encodeAppFileChunks(
+  transferId: string,
+  mime: string,
+  name: string,
+  bytes: Uint8Array,
+  chunkSize: number = LIMITS.imageChunkBytes
+): string[] {
+  if (!transferId || transferId.length > 64) {
+    throw new Error("Invalid transfer id");
+  }
+  if (bytes.byteLength < 1) throw new Error("Empty file");
+  if (bytes.byteLength > LIMITS.maxFileBytes) {
+    throw new Error(
+      `File too large (${bytes.byteLength} > ${LIMITS.maxFileBytes})`
+    );
+  }
+  const size = Math.max(1024, Math.min(chunkSize, LIMITS.imageChunkBytes * 2));
+  const n = Math.ceil(bytes.byteLength / size);
+  const safeMime = safeFileMime(mime);
+  const safeName = safeFileName(name);
+  const out: string[] = [];
+  for (let i = 0; i < n; i++) {
+    const start = i * size;
+    const slice = bytes.subarray(start, Math.min(start + size, bytes.byteLength));
+    const frame: Record<string, unknown> = {
+      id: transferId,
+      i,
+      n,
+      d: b64Encode(slice),
+    };
+    if (i === 0) {
+      frame.mime = safeMime;
+      frame.name = safeName;
+      frame.len = bytes.byteLength;
+    }
+    out.push(APP_FILE_CHUNK_PREFIX + JSON.stringify(frame));
+  }
+  return out;
 }
 
 /** Pack an animated ASCII emote id into an MLS application plaintext. */
@@ -452,6 +599,42 @@ export function decodeAppPayload(text: string): DecodedAppPayload {
       };
     } catch {
       return { kind: "text", text: "[invalid image chunk]" };
+    }
+  }
+
+  if (text.startsWith(APP_FILE_CHUNK_PREFIX)) {
+    try {
+      const raw = JSON.parse(text.slice(APP_FILE_CHUNK_PREFIX.length)) as {
+        id?: string;
+        i?: number;
+        n?: number;
+        mime?: string;
+        name?: string;
+        d?: string;
+        len?: number;
+      };
+      if (
+        typeof raw.id !== "string" ||
+        typeof raw.i !== "number" ||
+        typeof raw.n !== "number" ||
+        typeof raw.d !== "string" ||
+        !raw.d
+      ) {
+        return { kind: "text", text: "[invalid file chunk]" };
+      }
+      const data = b64Decode(raw.d);
+      return {
+        kind: "file_part",
+        id: raw.id.slice(0, 64),
+        i: raw.i | 0,
+        n: raw.n | 0,
+        mime: typeof raw.mime === "string" ? raw.mime : undefined,
+        name: typeof raw.name === "string" ? raw.name : undefined,
+        len: typeof raw.len === "number" ? raw.len : undefined,
+        data,
+      };
+    } catch {
+      return { kind: "text", text: "[invalid file chunk]" };
     }
   }
 
