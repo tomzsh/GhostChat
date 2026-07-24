@@ -113,6 +113,7 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
   const wsRef = useRef<WebSocket | null>(null);
   const mlsRef = useRef<MlsSession | null>(null);
   const membersRef = useRef<RoomMember[]>([]);
+  const messagesRef = useRef<ChatMessage[]>([]);
   const roomIdRef = useRef(roomId);
   const intentionalClose = useRef(false);
   const reconnectAttempt = useRef(0);
@@ -137,6 +138,7 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
   ttlModeRef.current = ttlMode;
   myIdRef.current = myId;
   membersRef.current = members;
+  messagesRef.current = messages;
 
   const enqueueMls = useCallback(<T,>(fn: () => Promise<T>): Promise<T> => {
     const next = mlsQueue.current.then(fn, fn);
@@ -301,28 +303,29 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
   /**
    * Burn messages with burn mode `on_leave` from a specific sender
    * (when that user leaves the room). Timed / on_read messages are unchanged.
+   * Side effects stay outside setState (Strict Mode safe).
    */
   const burnOnLeaveMessagesFrom = useCallback((senderId: string) => {
-    setMessages((prev) => {
-      const targets = prev.filter(
-        (m) => m.from === senderId && isOnLeaveTtl(m.ttlMode) && !m.burning
-      );
-      if (targets.length === 0) return prev;
-      for (const m of targets) {
-        const t = burnTimers.current.get(m.id);
-        if (t) {
-          clearTimeout(t);
-          burnTimers.current.delete(m.id);
-        }
+    if (!senderId) return;
+    const prev = messagesRef.current;
+    const targets = prev.filter(
+      (m) => m.from === senderId && isOnLeaveTtl(m.ttlMode) && !m.burning
+    );
+    if (targets.length === 0) return;
+    const ids = new Set(targets.map((m) => m.id));
+    for (const id of ids) {
+      const t = burnTimers.current.get(id);
+      if (t) {
+        clearTimeout(t);
+        burnTimers.current.delete(id);
       }
-      const ids = new Set(targets.map((m) => m.id));
-      setTimeout(() => {
-        setMessages((cur) => cur.filter((m) => !ids.has(m.id)));
-      }, 450);
-      return prev.map((m) =>
-        ids.has(m.id) ? { ...m, burning: true } : m
-      );
-    });
+    }
+    setMessages((cur) =>
+      cur.map((m) => (ids.has(m.id) ? { ...m, burning: true } : m))
+    );
+    setTimeout(() => {
+      setMessages((cur) => cur.filter((m) => !ids.has(m.id)));
+    }, 450);
   }, []);
 
   const scheduleTtl = useCallback(
@@ -762,11 +765,13 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
             })
           );
 
+          // `from` must match displayId so peer_left can burn on_leave by sender
+          const fromId = myIdRef.current ?? session.identity;
           setMessages((prev) => [
             ...prev,
             {
               id: messageId,
-              from: myIdRef.current ?? "You",
+              from: fromId,
               text: trimmed,
               mine: true,
               ttlMode: mode,
