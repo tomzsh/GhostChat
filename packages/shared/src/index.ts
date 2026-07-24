@@ -238,9 +238,18 @@ export type DecodedAppPayload =
     }
   | { kind: "emoji"; id: AsciiEmojiId };
 
+/** Chunked binary→base64 (avoids huge call stacks / quadratic string growth). */
 function b64Encode(bytes: Uint8Array): string {
+  const CHUNK = 0x2000;
   let binary = "";
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]!);
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    const end = Math.min(i + CHUNK, bytes.length);
+    let piece = "";
+    for (let j = i; j < end; j++) {
+      piece += String.fromCharCode(bytes[j]!);
+    }
+    binary += piece;
+  }
   return btoa(binary);
 }
 
@@ -249,6 +258,23 @@ function b64Decode(b64: string): Uint8Array {
   const out = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
   return out;
+}
+
+/** Force non-executable download MIME (mitigate HTML/SVG open-as-page). */
+export function safeDownloadMime(mime: string): string {
+  const m = (mime || "").toLowerCase().trim();
+  if (
+    !m ||
+    m === "text/html" ||
+    m === "image/svg+xml" ||
+    m === "application/xhtml+xml" ||
+    m.startsWith("text/javascript") ||
+    m === "application/javascript" ||
+    m === "application/x-javascript"
+  ) {
+    return "application/octet-stream";
+  }
+  return m.slice(0, 120);
 }
 
 function safeImageMime(mime: string): "image/jpeg" | "image/png" | "image/webp" {

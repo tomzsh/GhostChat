@@ -570,21 +570,7 @@ export class RoomDurableObject implements DurableObject {
       messageId: string;
     }
   ) {
-    const now = Date.now();
-    attachment.messageTimestamps = attachment.messageTimestamps.filter(
-      (t) => now - t < 1000
-    );
-    if (attachment.messageTimestamps.length >= LIMITS.maxMessagesPerSecond) {
-      this.send(ws, {
-        v: PROTOCOL_VERSION,
-        type: "error",
-        code: "rate_limited",
-      });
-      return;
-    }
-    attachment.messageTimestamps.push(now);
-    this.setAttachment(ws, attachment);
-
+    // Cheap rejects before rate-limit accounting
     if (msg.ciphertext.length > LIMITS.maxCiphertextBytes) {
       this.send(ws, {
         v: PROTOCOL_VERSION,
@@ -605,8 +591,38 @@ export class RoomDurableObject implements DurableObject {
       return;
     }
 
+    // Cap messageId length (chunked transfers append _N)
+    if (
+      typeof msg.messageId !== "string" ||
+      msg.messageId.length < 1 ||
+      msg.messageId.length > 96
+    ) {
+      this.send(ws, {
+        v: PROTOCOL_VERSION,
+        type: "error",
+        code: "invalid_payload",
+        message: "Invalid messageId",
+      });
+      return;
+    }
+
     const peers = this.joinedPeers(ws);
     if (peers.length === 0) return;
+
+    const now = Date.now();
+    attachment.messageTimestamps = attachment.messageTimestamps.filter(
+      (t) => now - t < 1000
+    );
+    if (attachment.messageTimestamps.length >= LIMITS.maxMessagesPerSecond) {
+      this.send(ws, {
+        v: PROTOCOL_VERSION,
+        type: "error",
+        code: "rate_limited",
+      });
+      return;
+    }
+    attachment.messageTimestamps.push(now);
+    this.setAttachment(ws, attachment);
 
     for (const peer of peers) {
       this.send(peer, {

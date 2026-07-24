@@ -9,7 +9,7 @@ import {
   type RoomConnectionState,
 } from "@/hooks/useGhostRoom";
 import { canNativeShare, copyText, shareRoomCode } from "@/lib/share";
-import type { AsciiEmojiId } from "@ghostchat/shared";
+import { LIMITS, type AsciiEmojiId } from "@ghostchat/shared";
 import { AnimatedAsciiEmoji } from "./AnimatedAsciiEmoji";
 import { AsciiEmojiPicker } from "./AsciiEmojiPicker";
 import { CloseRoomModal } from "./CloseRoomModal";
@@ -213,6 +213,7 @@ export function RoomChat({ roomId }: { roomId: string }) {
     notifyTyping,
     leaveRoom,
     canSend,
+    transferProgress,
   } = useGhostRoom({ roomId });
 
   const [draft, setDraft] = useState("");
@@ -429,8 +430,10 @@ export function RoomChat({ roomId }: { roomId: string }) {
       if (!file || !canSend) return;
       setSendingFile(true);
       try {
-        if (file.size > 1024 * 1024) {
-          throw new Error("File max 1MB");
+        if (file.size > LIMITS.maxFileBytes) {
+          throw new Error(
+            `File max ${Math.round(LIMITS.maxFileBytes / (1024 * 1024))}MB`
+          );
         }
         const buf = new Uint8Array(await file.arrayBuffer());
         const ok = await sendFile(
@@ -672,6 +675,14 @@ export function RoomChat({ roomId }: { roomId: string }) {
           >
             {ttlHint}
           </p>
+          {transferProgress ? (
+            <p
+              className="mb-1.5 font-mono text-[10px] text-ghost-amber sm:text-[11px]"
+              role="status"
+            >
+              sending · {transferProgress}
+            </p>
+          ) : null}
           <AsciiEmojiPicker
             open={emojiOpen}
             disabled={!canSend}

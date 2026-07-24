@@ -36,6 +36,7 @@ import {
   LIMITS,
   normalizeRoomId,
   parseTtlMs,
+  safeDownloadMime,
   type AsciiEmojiId,
   type TtlMode,
 } from "@ghostchat/shared";
@@ -99,6 +100,8 @@ const PING_MS = 25_000;
 const RECONNECT_BASE_MS = 800;
 const RECONNECT_MAX_MS = 8_000;
 const MAX_RECONNECT = 6;
+/** Cap local transcript to bound memory (object URLs for media). */
+const MAX_CHAT_MESSAGES = 120;
 /** Re-broadcast KeyPackage while waiting for Welcome. */
 const KP_RETRY_MS = [300, 1200, 2800, 5500, 9000] as const;
 
@@ -169,6 +172,11 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
   /** Reassemble multi-frame E2EE image / file transfers. */
   const imageAssembler = useRef(new ImageTransferAssembler());
   const fileAssembler = useRef(createFileTransferAssembler());
+  /** Serialize chunked media sends (avoid rate-limit races / mixed transfers). */
+  const mediaSendLock = useRef(false);
+  const [transferProgress, setTransferProgress] = useState<string | null>(
+    null
+  );
 
   // Keep refs in sync — roomIdRef stays on join key (not rotated public code)
   roomIdRef.current = joinIdRef.current;
@@ -335,6 +343,33 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     }
   }, []);
 
+  /** Append with hard cap — drop oldest messages and free object URLs. */
+  const pushMessage = useCallback(
+    (msg: ChatMessage) => {
+      setMessages((prev) => {
+        if (prev.some((m) => m.id === msg.id)) {
+          if (msg.imageUrl) URL.revokeObjectURL(msg.imageUrl);
+          if (msg.fileUrl) URL.revokeObjectURL(msg.fileUrl);
+          return prev;
+        }
+        const next = [...prev, msg];
+        if (next.length <= MAX_CHAT_MESSAGES) return next;
+        const overflow = next.length - MAX_CHAT_MESSAGES;
+        const dropped = next.slice(0, overflow);
+        revokeImageUrls(dropped);
+        for (const d of dropped) {
+          const t = burnTimers.current.get(d.id);
+          if (t) {
+            clearTimeout(t);
+            burnTimers.current.delete(d.id);
+          }
+        }
+        return next.slice(overflow);
+      });
+    },
+    [revokeImageUrls]
+  );
+
   const burnMessage = useCallback(
     (messageId: string, notifyPeer: boolean) => {
       setMessages((prev) => {
@@ -463,16 +498,10 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
         imageName: image.name,
         imageMime: image.mime,
       };
-      setMessages((prev) => {
-        if (prev.some((m) => m.id === meta.id)) {
-          URL.revokeObjectURL(imageUrl);
-          return prev;
-        }
-        return [...prev, msg];
-      });
+      pushMessage(msg);
       scheduleTtl(meta.id, meta.ttlMode, meta.mine);
     },
-    [scheduleTtl]
+    [scheduleTtl, pushMessage]
   );
 
   const appendFileMessage = useCallback(
@@ -485,8 +514,10 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
       },
       file: { mime: string; name: string; bytes: Uint8Array }
     ) => {
+      // Neutral MIME for download — avoid HTML/SVG rendering as a page
+      const downloadMime = safeDownloadMime(file.mime);
       const blob = new Blob([file.bytes as BlobPart], {
-        type: file.mime || "application/octet-stream",
+        type: downloadMime,
       });
       const fileUrl = URL.createObjectURL(blob);
       const msg: ChatMessage = {
@@ -499,19 +530,13 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
         kind: "file",
         fileUrl,
         fileName: file.name,
-        fileMime: file.mime,
+        fileMime: file.mime || downloadMime,
         fileSize: file.bytes.byteLength,
       };
-      setMessages((prev) => {
-        if (prev.some((m) => m.id === meta.id)) {
-          URL.revokeObjectURL(fileUrl);
-          return prev;
-        }
-        return [...prev, msg];
-      });
+      pushMessage(msg);
       scheduleTtl(meta.id, meta.ttlMode, meta.mine);
     },
-    [scheduleTtl]
+    [scheduleTtl, pushMessage]
   );
 
   const appendChatMessage = useCallback(
@@ -556,13 +581,10 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
           kind: "text",
         };
       }
-      setMessages((prev) => {
-        if (prev.some((m) => m.id === meta.id)) return prev;
-        return [...prev, msg];
-      });
+      pushMessage(msg);
       scheduleTtl(meta.id, meta.ttlMode, meta.mine);
     },
-    [scheduleTtl, appendImageMessage, appendFileMessage]
+    [scheduleTtl, appendImageMessage, appendFileMessage, pushMessage]
   );
 
   const onServerRef = useRef<(msg: ServerMessage) => void>(() => {});
@@ -1107,16 +1129,24 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     [sendAppPayload]
   );
 
-  /** Send paced E2EE MLS chunk frames; returns transferId on success. */
+  /** Send paced E2EE MLS chunk frames; returns success. Serialized via mediaSendLock. */
   const sendChunkedFrames = useCallback(
     async (
       frames: string[],
       transferId: string,
       label: string
     ): Promise<boolean> => {
+      if (mediaSendLock.current) {
+        setError("Already sending media — wait a moment");
+        return false;
+      }
+      mediaSendLock.current = true;
       const mode = ttlModeRef.current;
       try {
         for (let i = 0; i < frames.length; i++) {
+          setTransferProgress(
+            `${label} ${i + 1}/${frames.length}`
+          );
           const frame = frames[i]!;
           const wireId = i === 0 ? transferId : `${transferId}_${i}`;
           const ok = await enqueueMls(async () => {
@@ -1167,6 +1197,9 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
           e instanceof Error ? e.message : `Failed to send ${label}`
         );
         return false;
+      } finally {
+        mediaSendLock.current = false;
+        setTransferProgress(null);
       }
     },
     [persistMls, enqueueMls]
@@ -1318,23 +1351,38 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     clearKpRetries();
     imageAssembler.current.clear();
     fileAssembler.current.clear();
+    mediaSendLock.current = false;
+    setTransferProgress(null);
     if (typingTimer.current) clearTimeout(typingTimer.current);
     const rid = roomIdRef.current;
     clearRoomSession(rid);
     clearCachedMlsSession(rid);
-    // Explicit leave so server rotates invite while socket is still open
+    // Explicit leave first so server can rotate before socket dies.
+    // Brief delay lets the browser flush the frame; close is a backup.
+    const ws = wsRef.current;
     try {
-      const ws = wsRef.current;
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ v: PROTOCOL_VERSION, type: "leave" }));
+        window.setTimeout(() => {
+          try {
+            if (ws.readyState === WebSocket.OPEN) ws.close(1000, "leave");
+          } catch {
+            /* ignore */
+          }
+        }, 80);
+      } else {
+        try {
+          ws?.close(1000, "leave");
+        } catch {
+          /* ignore */
+        }
       }
     } catch {
-      /* ignore */
-    }
-    try {
-      wsRef.current?.close(1000, "leave");
-    } catch {
-      /* ignore */
+      try {
+        ws?.close(1000, "leave");
+      } catch {
+        /* ignore */
+      }
     }
     wsRef.current = null;
     mlsRef.current = null;
@@ -1384,6 +1432,8 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     sendImage,
     sendFile,
     sendEmoji,
+    /** e.g. "file 3/12" while chunked media is uploading */
+    transferProgress,
     notifyTyping,
     leaveRoom,
     canSend: canSendUi,
