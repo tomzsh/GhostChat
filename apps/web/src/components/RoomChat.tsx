@@ -96,6 +96,7 @@ function statusLine(
 }
 
 const MessageRow = memo(function MessageRow({ m }: { m: ChatMessage }) {
+  const isImage = m.kind === "image" && m.imageUrl;
   return (
     <div
       className={`rounded px-2 py-1.5 ${
@@ -105,18 +106,41 @@ const MessageRow = memo(function MessageRow({ m }: { m: ChatMessage }) {
       <div className="mb-0.5 flex items-baseline justify-between gap-2">
         <span className="text-[10px] text-ghost-dim sm:text-[11px]">
           {m.mine ? "you" : m.from}
+          {isImage ? " · img" : ""}
         </span>
         <span className="shrink-0 text-[9px] text-ghost-dim/50">
           burn:{ttlShort(m.ttlMode)}
         </span>
       </div>
-      <p
-        className={`break-words text-[13px] leading-snug sm:text-sm ${
-          m.mine ? "text-ghost-green" : "text-white"
-        }`}
-      >
-        {m.text}
-      </p>
+      {isImage ? (
+        <a
+          href={m.imageUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="block max-w-full"
+        >
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={m.imageUrl}
+            alt={m.imageName || "encrypted image"}
+            className="max-h-56 max-w-full rounded border border-ghost-border/60 object-contain"
+            loading="lazy"
+          />
+          {m.imageName ? (
+            <span className="mt-1 block truncate text-[10px] text-ghost-dim">
+              {m.imageName}
+            </span>
+          ) : null}
+        </a>
+      ) : (
+        <p
+          className={`break-words text-[13px] leading-snug sm:text-sm ${
+            m.mine ? "text-ghost-green" : "text-white"
+          }`}
+        >
+          {m.text}
+        </p>
+      )}
     </div>
   );
 });
@@ -141,6 +165,7 @@ export function RoomChat({ roomId }: { roomId: string }) {
     error,
     safetyNumber,
     sendMessage,
+    sendImage,
     notifyTyping,
     leaveRoom,
     canSend,
@@ -152,6 +177,7 @@ export function RoomChat({ roomId }: { roomId: string }) {
   const [closeModalOpen, setCloseModalOpen] = useState(false);
   const [supportsShare, setSupportsShare] = useState(false);
   const [showQr, setShowQr] = useState(true);
+  const [sendingImage, setSendingImage] = useState(false);
   const [presenceEvent, setPresenceEvent] = useState<PresenceEvent | null>(
     null
   );
@@ -159,6 +185,7 @@ export function RoomChat({ roomId }: { roomId: string }) {
   const prevMemberIds = useRef<string[] | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const feedbackTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const ttlMeta = TTL_OPTIONS.find((o) => o.value === ttlMode);
@@ -308,6 +335,39 @@ export function RoomChat({ roomId }: { roomId: string }) {
       else notifyTyping(false);
     },
     [notifyTyping]
+  );
+
+  const onPickImage = useCallback(() => {
+    if (!canSend || sendingImage) return;
+    fileInputRef.current?.click();
+  }, [canSend, sendingImage]);
+
+  const onImageSelected = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      e.target.value = "";
+      if (!file || !canSend) return;
+      setSendingImage(true);
+      try {
+        const { compressImageForSend } = await import("@/lib/compressImage");
+        const compressed = await compressImageForSend(file);
+        const ok = await sendImage(
+          compressed.bytes,
+          compressed.mime,
+          compressed.name
+        );
+        if (ok) flash("ok", "Image sent");
+        else flash("err", "Send failed");
+      } catch (err) {
+        flash(
+          "err",
+          err instanceof Error ? err.message : "Image compress failed"
+        );
+      } finally {
+        setSendingImage(false);
+      }
+    },
+    [canSend, sendImage, flash]
   );
 
   return (
@@ -521,6 +581,24 @@ export function RoomChat({ roomId }: { roomId: string }) {
           </p>
           <div className="flex items-stretch gap-2">
             <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              capture="environment"
+              className="hidden"
+              onChange={onImageSelected}
+            />
+            <button
+              type="button"
+              onClick={onPickImage}
+              disabled={!canSend || sendingImage}
+              className="chip !min-h-11 shrink-0 touch-manipulation px-2.5 text-[12px] disabled:opacity-40"
+              aria-label="Send image"
+              title="Send compressed image (E2EE)"
+            >
+              {sendingImage ? "…" : "img"}
+            </button>
+            <input
               ref={inputRef}
               value={draft}
               onChange={(e) => onDraftChange(e.target.value)}
@@ -536,7 +614,7 @@ export function RoomChat({ roomId }: { roomId: string }) {
             />
             <button
               type="submit"
-              disabled={!canSend || !draft.trim()}
+              disabled={!canSend || !draft.trim() || sendingImage}
               className="min-h-11 min-w-[4.25rem] shrink-0 touch-manipulation bg-ghost-green px-3 text-sm font-semibold text-black disabled:opacity-40 sm:min-w-[5rem]"
             >
               Send

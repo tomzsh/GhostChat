@@ -24,6 +24,8 @@ import {
   type PeerInfo,
 } from "@ghostchat/protocol";
 import {
+  decodeAppPayload,
+  encodeAppImage,
   generateMessageId,
   isOnLeaveTtl,
   parseTtlMs,
@@ -50,6 +52,11 @@ export type ChatMessage = {
   ttlMode: TtlMode;
   receivedAt: number;
   burning?: boolean;
+  kind?: "text" | "image";
+  /** Object URL for decrypted/local image (revoke on burn). */
+  imageUrl?: string;
+  imageName?: string;
+  imageMime?: string;
 };
 
 export type RoomMember = {
@@ -267,33 +274,52 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     });
   }, [enqueueMls, persistMls, sendJson]);
 
-  const burnMessage = useCallback((messageId: string, notifyPeer: boolean) => {
-    setMessages((prev) => {
-      if (!prev.some((m) => m.id === messageId)) return prev;
-      return prev.map((m) =>
-        m.id === messageId ? { ...m, burning: true } : m
-      );
-    });
-    setTimeout(() => {
-      setMessages((prev) => prev.filter((m) => m.id !== messageId));
-    }, 400);
-
-    const t = burnTimers.current.get(messageId);
-    if (t) {
-      clearTimeout(t);
-      burnTimers.current.delete(messageId);
-    }
-
-    if (notifyPeer && wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({
-          v: PROTOCOL_VERSION,
-          type: "burn",
-          messageId,
-        })
-      );
+  const revokeImageUrls = useCallback((msgs: ChatMessage[]) => {
+    for (const m of msgs) {
+      if (m.imageUrl) {
+        try {
+          URL.revokeObjectURL(m.imageUrl);
+        } catch {
+          /* ignore */
+        }
+      }
     }
   }, []);
+
+  const burnMessage = useCallback(
+    (messageId: string, notifyPeer: boolean) => {
+      setMessages((prev) => {
+        if (!prev.some((m) => m.id === messageId)) return prev;
+        return prev.map((m) =>
+          m.id === messageId ? { ...m, burning: true } : m
+        );
+      });
+      setTimeout(() => {
+        setMessages((prev) => {
+          const doomed = prev.filter((m) => m.id === messageId);
+          revokeImageUrls(doomed);
+          return prev.filter((m) => m.id !== messageId);
+        });
+      }, 400);
+
+      const t = burnTimers.current.get(messageId);
+      if (t) {
+        clearTimeout(t);
+        burnTimers.current.delete(messageId);
+      }
+
+      if (notifyPeer && wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({
+            v: PROTOCOL_VERSION,
+            type: "burn",
+            messageId,
+          })
+        );
+      }
+    },
+    [revokeImageUrls]
+  );
 
   /** Burn all local messages (leave room / room closed). */
   const burnAllMessages = useCallback(() => {
@@ -303,38 +329,18 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
       return prev.map((m) => ({ ...m, burning: true }));
     });
     setTimeout(() => {
-      setMessages([]);
+      setMessages((prev) => {
+        revokeImageUrls(prev);
+        return [];
+      });
     }, 450);
-  }, [clearBurnTimers]);
+  }, [clearBurnTimers, revokeImageUrls]);
 
   /**
    * Burn messages with burn mode `on_leave` from a specific sender
    * (when that user leaves the room). Timed / on_read messages are unchanged.
    * Side effects stay outside setState (Strict Mode safe).
    */
-  const burnOnLeaveMessagesFrom = useCallback((senderId: string) => {
-    if (!senderId) return;
-    const prev = messagesRef.current;
-    const targets = prev.filter(
-      (m) => m.from === senderId && isOnLeaveTtl(m.ttlMode) && !m.burning
-    );
-    if (targets.length === 0) return;
-    const ids = new Set(targets.map((m) => m.id));
-    for (const id of ids) {
-      const t = burnTimers.current.get(id);
-      if (t) {
-        clearTimeout(t);
-        burnTimers.current.delete(id);
-      }
-    }
-    setMessages((cur) =>
-      cur.map((m) => (ids.has(m.id) ? { ...m, burning: true } : m))
-    );
-    setTimeout(() => {
-      setMessages((cur) => cur.filter((m) => !ids.has(m.id)));
-    }, 450);
-  }, []);
-
   const scheduleTtl = useCallback(
     (messageId: string, mode: TtlMode, mine: boolean) => {
       // Keep until sender leaves — no clock / on-read autodelete
@@ -352,6 +358,88 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
       burnTimers.current.set(messageId, t);
     },
     [burnMessage]
+  );
+
+  const burnOnLeaveMessagesFrom = useCallback(
+    (senderId: string) => {
+      if (!senderId) return;
+      const prev = messagesRef.current;
+      const targets = prev.filter(
+        (m) => m.from === senderId && isOnLeaveTtl(m.ttlMode) && !m.burning
+      );
+      if (targets.length === 0) return;
+      const ids = new Set(targets.map((m) => m.id));
+      for (const id of ids) {
+        const t = burnTimers.current.get(id);
+        if (t) {
+          clearTimeout(t);
+          burnTimers.current.delete(id);
+        }
+      }
+      setMessages((cur) =>
+        cur.map((m) => (ids.has(m.id) ? { ...m, burning: true } : m))
+      );
+      setTimeout(() => {
+        setMessages((cur) => {
+          const doomed = cur.filter((m) => ids.has(m.id));
+          revokeImageUrls(doomed);
+          return cur.filter((m) => !ids.has(m.id));
+        });
+      }, 450);
+    },
+    [revokeImageUrls]
+  );
+
+  const appendChatMessage = useCallback(
+    (
+      rawText: string,
+      meta: {
+        id: string;
+        from: string;
+        mine: boolean;
+        ttlMode: TtlMode;
+      }
+    ) => {
+      const parsed = decodeAppPayload(rawText);
+      let msg: ChatMessage;
+      if (parsed.kind === "image") {
+        const blob = new Blob([parsed.bytes as BlobPart], {
+          type: parsed.mime,
+        });
+        const imageUrl = URL.createObjectURL(blob);
+        msg = {
+          id: meta.id,
+          from: meta.from,
+          text: "",
+          mine: meta.mine,
+          ttlMode: meta.ttlMode,
+          receivedAt: Date.now(),
+          kind: "image",
+          imageUrl,
+          imageName: parsed.name,
+          imageMime: parsed.mime,
+        };
+      } else {
+        msg = {
+          id: meta.id,
+          from: meta.from,
+          text: parsed.text,
+          mine: meta.mine,
+          ttlMode: meta.ttlMode,
+          receivedAt: Date.now(),
+          kind: "text",
+        };
+      }
+      setMessages((prev) => {
+        if (prev.some((m) => m.id === meta.id)) {
+          if (msg.imageUrl) URL.revokeObjectURL(msg.imageUrl);
+          return prev;
+        }
+        return [...prev, msg];
+      });
+      scheduleTtl(meta.id, meta.ttlMode, meta.mine);
+    },
+    [scheduleTtl]
   );
 
   const onServerRef = useRef<(msg: ServerMessage) => void>(() => {});
@@ -542,21 +630,12 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
             const result = await decryptApp(session, msg.ciphertext);
             persistMls(result.session);
             if (!result.text) return;
-            setMessages((prev) => {
-              if (prev.some((m) => m.id === msg.messageId)) return prev;
-              return [
-                ...prev,
-                {
-                  id: msg.messageId,
-                  from: msg.from,
-                  text: result.text,
-                  mine: false,
-                  ttlMode: msg.ttlMode,
-                  receivedAt: Date.now(),
-                },
-              ];
+            appendChatMessage(result.text, {
+              id: msg.messageId,
+              from: msg.from,
+              mine: false,
+              ttlMode: msg.ttlMode,
             });
-            scheduleTtl(msg.messageId, msg.ttlMode, false);
             setTypingPeers((prev) => prev.filter((id) => id !== msg.from));
           } catch {
             setError("Failed to decrypt MLS message");
@@ -753,12 +832,9 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     };
   }, [roomId, clearBurnTimers, clearKpRetries]);
 
-  const sendMessage = useCallback(
-    async (text: string) => {
-      const trimmed = text.trim();
-      if (!trimmed) return false;
+  const sendAppPayload = useCallback(
+    async (plaintext: string) => {
       const ws = wsRef.current;
-
       if (!ws || ws.readyState !== WebSocket.OPEN) {
         setError("Not connected — wait a moment or refresh");
         return false;
@@ -778,7 +854,7 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
           if (!session?.state || !wsRef.current) return false;
           const messageId = generateMessageId();
           const mode = ttlModeRef.current;
-          const enc = await encryptApp(session, trimmed);
+          const enc = await encryptApp(session, plaintext);
           persistMls(enc.session);
           wsRef.current.send(
             JSON.stringify({
@@ -791,20 +867,13 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
             })
           );
 
-          // `from` must match displayId so peer_left can burn on_leave by sender
           const fromId = myIdRef.current ?? session.identity;
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: messageId,
-              from: fromId,
-              text: trimmed,
-              mine: true,
-              ttlMode: mode,
-              receivedAt: Date.now(),
-            },
-          ]);
-          scheduleTtl(messageId, mode, true);
+          appendChatMessage(plaintext, {
+            id: messageId,
+            from: fromId,
+            mine: true,
+            ttlMode: mode,
+          });
           setMeTyping(false);
           lastTypingSent.current = false;
           wsRef.current.send(
@@ -822,7 +891,30 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
         return false;
       }
     },
-    [scheduleTtl, persistMls, enqueueMls]
+    [appendChatMessage, persistMls, enqueueMls]
+  );
+
+  const sendMessage = useCallback(
+    async (text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed) return false;
+      return sendAppPayload(trimmed);
+    },
+    [sendAppPayload]
+  );
+
+  /** Send a compressed image (already JPEG bytes) as an E2EE app message. */
+  const sendImage = useCallback(
+    async (bytes: Uint8Array, mime: string, name: string) => {
+      try {
+        const payload = encodeAppImage(mime, name, bytes);
+        return await sendAppPayload(payload);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Failed to send image");
+        return false;
+      }
+    },
+    [sendAppPayload]
   );
 
   const notifyTyping = useCallback((isTyping: boolean) => {
@@ -917,6 +1009,7 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     error,
     safetyNumber,
     sendMessage,
+    sendImage,
     notifyTyping,
     leaveRoom,
     canSend: canSendUi,

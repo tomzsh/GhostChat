@@ -202,6 +202,10 @@ export function Landing() {
               old links stop working for new joiners.
             </li>
             <li>
+              Optional <strong className="text-white">images</strong> (compressed, E2EE) — no
+              server storage.
+            </li>
+            <li>
               Not protected: compromised devices, sharing the room code with the
               wrong people.
             </li>

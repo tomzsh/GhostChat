@@ -58,6 +58,22 @@ describe("ttl modes", () => {
   });
 });
 
+describe("app image payload", () => {
+  it("round-trips image encode/decode", async () => {
+    const { encodeAppImage, decodeAppPayload } = await import("./index.ts");
+    const bytes = new Uint8Array([1, 2, 3, 4, 255, 0, 128]);
+    const wire = encodeAppImage("image/jpeg", "test.jpg", bytes);
+    const parsed = decodeAppPayload(wire);
+    assert.equal(parsed.kind, "image");
+    if (parsed.kind === "image") {
+      assert.equal(parsed.mime, "image/jpeg");
+      assert.equal(parsed.name, "test.jpg");
+      assert.deepEqual(parsed.bytes, bytes);
+    }
+    assert.equal(decodeAppPayload("hello").kind, "text");
+  });
+});
+
 describe("max participants", () => {
   it("clamps into allowed range", () => {
     assert.equal(clampMaxParticipants(2), 2);

@@ -2,6 +2,12 @@
 
 All notable changes to GhostChat are documented in this file.
 
+## [2.4.0] — 2026-07-24
+
+### Added
+- **Ephemeral images**: compress client-side (≤~280KB JPEG), E2EE via MLS app
+  payload, preview in chat; burns with message TTL / on_leave / leave
+
 ## [2.3.0] — 2026-07-24
 
 ### Added

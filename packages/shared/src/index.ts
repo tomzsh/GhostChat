@@ -49,10 +49,17 @@ export const LIMITS = {
   /** @deprecated use maxParticipantsCap — kept for older imports */
   maxParticipants: 20,
   maxMessagesPerSecond: 5,
-  /** MLS PrivateMessage / Welcome / Commit can exceed small AEAD blobs. */
-  maxCiphertextBytes: 48 * 1024,
+  /**
+   * Max application ciphertext (base64 length roughly 4/3 of plaintext).
+   * Sized for compressed images (~280KB) inside MLS PrivateMessages.
+   */
+  maxCiphertextBytes: 512 * 1024,
   /** Max base64 size for MLS control frames (key package, welcome, commit). */
   maxMlsPayloadBytes: 96 * 1024,
+  /** Max compressed image bytes before E2EE (JPEG/WebP). */
+  maxImageBytes: 280 * 1024,
+  /** Longest edge when client-resizing images before send. */
+  maxImageEdgePx: 1280,
   idleTimeoutMs: 10 * 60 * 1000,
   maxAgeMs: 24 * 60 * 60 * 1000,
   reconnectGraceMs: 30 * 1000,
@@ -110,4 +117,89 @@ export function isValidTtlMode(mode: string): mode is TtlMode {
   if (!m) return false;
   const n = parseInt(m[1]!, 10);
   return n >= 1 && n <= 3600;
+}
+
+// --- Ephemeral image payloads (inside MLS app messages) ---
+
+/** Magic prefix so receivers can distinguish text vs image app payloads. */
+export const APP_IMAGE_PREFIX = "\u0001GCIMG1:" as const;
+
+export type DecodedAppPayload =
+  | { kind: "text"; text: string }
+  | {
+      kind: "image";
+      mime: string;
+      name: string;
+      bytes: Uint8Array;
+    };
+
+function b64Encode(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]!);
+  return btoa(binary);
+}
+
+function b64Decode(b64: string): Uint8Array {
+  const binary = atob(b64);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
+/** Pack compressed image bytes into an MLS application plaintext string. */
+export function encodeAppImage(
+  mime: string,
+  name: string,
+  bytes: Uint8Array
+): string {
+  if (bytes.byteLength > LIMITS.maxImageBytes) {
+    throw new Error(
+      `Image too large (${bytes.byteLength} > ${LIMITS.maxImageBytes})`
+    );
+  }
+  const safeMime =
+    mime === "image/jpeg" || mime === "image/png" || mime === "image/webp"
+      ? mime
+      : "image/jpeg";
+  const safeName = (name || "image").slice(0, 80).replace(/[^\w.\-()+ ]/g, "_");
+  return (
+    APP_IMAGE_PREFIX +
+    JSON.stringify({
+      mime: safeMime,
+      name: safeName,
+      data: b64Encode(bytes),
+    })
+  );
+}
+
+/** Parse MLS application plaintext into text or image. */
+export function decodeAppPayload(text: string): DecodedAppPayload {
+  if (!text.startsWith(APP_IMAGE_PREFIX)) {
+    return { kind: "text", text };
+  }
+  try {
+    const raw = JSON.parse(text.slice(APP_IMAGE_PREFIX.length)) as {
+      mime?: string;
+      name?: string;
+      data?: string;
+    };
+    if (typeof raw.data !== "string" || !raw.data) {
+      return { kind: "text", text: "[invalid image]" };
+    }
+    const bytes = b64Decode(raw.data);
+    if (bytes.byteLength > LIMITS.maxImageBytes * 1.1) {
+      return { kind: "text", text: "[image too large]" };
+    }
+    return {
+      kind: "image",
+      mime:
+        raw.mime === "image/png" || raw.mime === "image/webp"
+          ? raw.mime
+          : "image/jpeg",
+      name: typeof raw.name === "string" ? raw.name.slice(0, 80) : "image",
+      bytes,
+    };
+  } catch {
+    return { kind: "text", text: "[invalid image]" };
+  }
 }
