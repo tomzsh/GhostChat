@@ -26,9 +26,13 @@ import {
 import {
   decodeAppPayload,
   encodeAppEmoji,
-  encodeAppImage,
+  encodeAppImageChunks,
   generateMessageId,
+  ImageTransferAssembler,
   isOnLeaveTtl,
+  isValidRoomId,
+  LIMITS,
+  normalizeRoomId,
   parseTtlMs,
   type AsciiEmojiId,
   type TtlMode,
@@ -43,6 +47,9 @@ import {
   clearRoomSession,
   getOrCreateDisplayId,
   getOrCreateSessionToken,
+  migrateRoomIdentity,
+  rememberWsInternal,
+  resolveWsInternal,
   sessionSet,
 } from "@/lib/session";
 
@@ -121,13 +128,19 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
   const [error, setError] = useState<string | null>(null);
   const [safetyNumber, setSafetyNumber] = useState<string | null>(null);
   /** Public invite code (rotates when someone leaves). */
-  const [publicCode, setPublicCode] = useState(roomId);
+  const [publicCode, setPublicCode] = useState(() => normalizeRoomId(roomId));
 
   const wsRef = useRef<WebSocket | null>(null);
   const mlsRef = useRef<MlsSession | null>(null);
   const membersRef = useRef<RoomMember[]>([]);
   const messagesRef = useRef<ChatMessage[]>([]);
-  const roomIdRef = useRef(roomId);
+  /**
+   * Stable WS / session key = durable object internal id.
+   * Starts as URL code (or mapped internal after prior rotation); upgraded to
+   * server `internalId` on joined so later reconnects survive invite rotation.
+   */
+  const joinIdRef = useRef(resolveWsInternal(roomId));
+  const roomIdRef = useRef(joinIdRef.current);
   const intentionalClose = useRef(false);
   const reconnectAttempt = useRef(0);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -146,17 +159,34 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
   const ttlModeRef = useRef(ttlMode);
   const myIdRef = useRef(myId);
   const lastTypingSent = useRef(false);
+  /** Reassemble multi-frame E2EE image transfers. */
+  const imageAssembler = useRef(new ImageTransferAssembler());
 
-  roomIdRef.current = roomId;
+  // Keep refs in sync — roomIdRef stays on join key (not rotated public code)
+  roomIdRef.current = joinIdRef.current;
   ttlModeRef.current = ttlMode;
   myIdRef.current = myId;
   membersRef.current = members;
   messagesRef.current = messages;
 
-  // Keep publicCode in sync if parent navigates to a new invite URL
-  useEffect(() => {
-    setPublicCode(roomId);
-  }, [roomId]);
+  const applyPublicCode = useCallback((code: string) => {
+    const next = normalizeRoomId(code);
+    if (!next || !isValidRoomId(next)) return;
+    // Bind new public code → stable internal WS id for remount recovery
+    rememberWsInternal(next, joinIdRef.current);
+    setPublicCode((prev) => (prev === next ? prev : next));
+    // Soft URL update for shareability. WS stays on joinIdRef (internal id).
+    if (typeof window !== "undefined") {
+      try {
+        const path = `/r/${next}`;
+        if (window.location.pathname !== path) {
+          window.history.replaceState(null, "", path);
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  }, []);
 
   const enqueueMls = useCallback(<T,>(fn: () => Promise<T>): Promise<T> => {
     const next = mlsQueue.current.then(fn, fn);
@@ -394,6 +424,42 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     [revokeImageUrls]
   );
 
+  const appendImageMessage = useCallback(
+    (
+      meta: {
+        id: string;
+        from: string;
+        mine: boolean;
+        ttlMode: TtlMode;
+      },
+      image: { mime: string; name: string; bytes: Uint8Array }
+    ) => {
+      const blob = new Blob([image.bytes as BlobPart], { type: image.mime });
+      const imageUrl = URL.createObjectURL(blob);
+      const msg: ChatMessage = {
+        id: meta.id,
+        from: meta.from,
+        text: "",
+        mine: meta.mine,
+        ttlMode: meta.ttlMode,
+        receivedAt: Date.now(),
+        kind: "image",
+        imageUrl,
+        imageName: image.name,
+        imageMime: image.mime,
+      };
+      setMessages((prev) => {
+        if (prev.some((m) => m.id === meta.id)) {
+          URL.revokeObjectURL(imageUrl);
+          return prev;
+        }
+        return [...prev, msg];
+      });
+      scheduleTtl(meta.id, meta.ttlMode, meta.mine);
+    },
+    [scheduleTtl]
+  );
+
   const appendChatMessage = useCallback(
     (
       rawText: string,
@@ -405,24 +471,12 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
       }
     ) => {
       const parsed = decodeAppPayload(rawText);
+      // Chunks are assembled separately — never show partial frames as text
+      if (parsed.kind === "image_part") return;
       let msg: ChatMessage;
       if (parsed.kind === "image") {
-        const blob = new Blob([parsed.bytes as BlobPart], {
-          type: parsed.mime,
-        });
-        const imageUrl = URL.createObjectURL(blob);
-        msg = {
-          id: meta.id,
-          from: meta.from,
-          text: "",
-          mine: meta.mine,
-          ttlMode: meta.ttlMode,
-          receivedAt: Date.now(),
-          kind: "image",
-          imageUrl,
-          imageName: parsed.name,
-          imageMime: parsed.mime,
-        };
+        appendImageMessage(meta, parsed);
+        return;
       } else if (parsed.kind === "emoji") {
         msg = {
           id: meta.id,
@@ -446,15 +500,12 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
         };
       }
       setMessages((prev) => {
-        if (prev.some((m) => m.id === meta.id)) {
-          if (msg.imageUrl) URL.revokeObjectURL(msg.imageUrl);
-          return prev;
-        }
+        if (prev.some((m) => m.id === meta.id)) return prev;
         return [...prev, msg];
       });
       scheduleTtl(meta.id, meta.ttlMode, meta.mine);
     },
-    [scheduleTtl]
+    [scheduleTtl, appendImageMessage]
   );
 
   const onServerRef = useRef<(msg: ServerMessage) => void>(() => {});
@@ -463,13 +514,37 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
 
     switch (msg.type) {
       case "joined": {
+        // Lock WS to durable internal id so reconnect works after invite rotation
+        const prevKey = rid;
+        const internalRaw = String(msg.internalId ?? "").trim();
+        const internal = normalizeRoomId(internalRaw);
+        if (internal && isValidRoomId(internal) && internal !== prevKey) {
+          migrateRoomIdentity(prevKey, internal);
+          joinIdRef.current = internal;
+          roomIdRef.current = internal;
+          // Move MLS cache key to internal id
+          const cachedMls = getCachedMlsSession(prevKey) ?? mlsRef.current;
+          if (cachedMls) {
+            setCachedMlsSession(internal, cachedMls);
+            clearCachedMlsSession(prevKey);
+          }
+        } else if (internal && isValidRoomId(internal)) {
+          joinIdRef.current = internal;
+          roomIdRef.current = internal;
+          rememberWsInternal(internal, internal);
+        }
+        // Prefer server public invite code (may already be rotated)
+        if (msg.publicCode) applyPublicCode(String(msg.publicCode));
+        else rememberWsInternal(prevKey, joinIdRef.current);
+
+        const sid = joinIdRef.current;
         // Keep MLS bootstrap on the same queue as commits/encrypt
         void enqueueMls(async () => {
           setMyId(msg.yourId);
           myIdRef.current = msg.yourId;
           setError(null);
-          if (msg.sessionToken) sessionSet(`session:${rid}`, msg.sessionToken);
-          if (msg.yourId) sessionSet(`display:${rid}`, msg.yourId);
+          if (msg.sessionToken) sessionSet(`session:${sid}`, msg.sessionToken);
+          if (msg.yourId) sessionSet(`display:${sid}`, msg.yourId);
           setMaxParticipants(msg.maxParticipants ?? 2);
           setParticipantCount(msg.participantCount ?? 1);
 
@@ -486,13 +561,13 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
           setMembers(peers);
 
           let session =
-            getCachedMlsSession(rid) ??
+            getCachedMlsSession(sid) ??
             mlsRef.current ??
-            (await createMlsSession(msg.yourId, rid));
+            (await createMlsSession(msg.yourId, sid));
 
           // Identity must match assigned display id
-          if (session.identity !== msg.yourId || session.groupId !== rid) {
-            session = await createMlsSession(msg.yourId, rid);
+          if (session.identity !== msg.yourId || session.groupId !== sid) {
+            session = await createMlsSession(msg.yourId, sid);
           }
 
           if (session.state) {
@@ -534,6 +609,8 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
       }
       case "peer_left": {
         const leftId = msg.peerId;
+        // Invite rotation piggy-backed on leave (also sent as room_code)
+        if (msg.publicCode) applyPublicCode(String(msg.publicCode));
         setMembers((prev) => {
           const next = prev.filter((m) => m.id !== leftId);
           membersRef.current = next;
@@ -645,12 +722,42 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
             const result = await decryptApp(session, msg.ciphertext);
             persistMls(result.session);
             if (!result.text) return;
-            appendChatMessage(result.text, {
-              id: msg.messageId,
-              from: msg.from,
-              mine: false,
-              ttlMode: msg.ttlMode,
-            });
+
+            const parsed = decodeAppPayload(result.text);
+            if (parsed.kind === "image_part") {
+              const progress = imageAssembler.current.ingest({
+                id: parsed.id,
+                i: parsed.i,
+                n: parsed.n,
+                mime: parsed.mime,
+                name: parsed.name,
+                len: parsed.len,
+                data: parsed.data,
+              });
+              if (progress.status === "complete") {
+                appendImageMessage(
+                  {
+                    id: progress.id,
+                    from: msg.from,
+                    mine: false,
+                    ttlMode: msg.ttlMode,
+                  },
+                  {
+                    mime: progress.mime,
+                    name: progress.name,
+                    bytes: progress.bytes,
+                  }
+                );
+              }
+              // pending / error: stay silent (ephemeral transfer)
+            } else {
+              appendChatMessage(result.text, {
+                id: msg.messageId,
+                from: msg.from,
+                mine: false,
+                ttlMode: msg.ttlMode,
+              });
+            }
             setTypingPeers((prev) => prev.filter((id) => id !== msg.from));
           } catch {
             setError("Failed to decrypt MLS message");
@@ -696,22 +803,7 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
         break;
       }
       case "room_code": {
-        const code = String(msg.publicCode ?? "")
-          .trim()
-          .toUpperCase();
-        if (!code) break;
-        setPublicCode((prev) => (prev === code ? prev : code));
-        // Soft URL update — do not remount room / drop WS
-        if (typeof window !== "undefined") {
-          try {
-            const path = `/r/${code}`;
-            if (window.location.pathname !== path) {
-              window.history.replaceState(null, "", path);
-            }
-          } catch {
-            /* ignore */
-          }
-        }
+        applyPublicCode(String(msg.publicCode ?? ""));
         break;
       }
       case "pong":
@@ -720,6 +812,10 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
   };
 
   useEffect(() => {
+    // Resolve mapped internal id if this tab already rotated invite codes
+    joinIdRef.current = resolveWsInternal(joinIdRef.current);
+    roomIdRef.current = joinIdRef.current;
+
     intentionalClose.current = false;
     reconnectAttempt.current = 0;
     setState("connecting");
@@ -733,21 +829,26 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     clearKpRetries();
     pendingKp.current.clear();
     addingPeer.current.clear();
+    imageAssembler.current.clear();
 
-    const cached = getCachedMlsSession(roomId);
+    const initialId = joinIdRef.current;
+    const cached = getCachedMlsSession(initialId);
     mlsRef.current = cached;
     if (cached) setSafetyNumber(epochSafetyNumber(cached));
 
-    const displayId = getOrCreateDisplayId(roomId);
-    setMyId(displayId);
+    setMyId(getOrCreateDisplayId(initialId));
 
     let pingTimer: ReturnType<typeof setInterval> | null = null;
     let disposed = false;
 
     const connect = () => {
       if (disposed) return;
-      const token = getOrCreateSessionToken(roomId);
-      const url = getWsUrl(roomId);
+      // Always read latest — may upgrade to server internalId after joined
+      const id = joinIdRef.current;
+      roomIdRef.current = id;
+      const token = getOrCreateSessionToken(id);
+      const displayId = getOrCreateDisplayId(id);
+      const url = getWsUrl(id);
       setState((s) =>
         s === "ready" || s === "waiting_peer" || s === "peer_left"
           ? s
@@ -845,7 +946,9 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
       // Keep MLS cache across Strict Mode remount
       mlsRef.current = null;
     };
-  }, [roomId, clearBurnTimers, clearKpRetries]);
+    // joinIdRef is frozen — do not re-connect when Next soft-nav updates roomId prop
+    // after invite code rotation.
+  }, [clearBurnTimers, clearKpRetries]);
 
   const sendAppPayload = useCallback(
     async (plaintext: string) => {
@@ -918,18 +1021,101 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     [sendAppPayload]
   );
 
-  /** Send a compressed image (already JPEG bytes) as an E2EE app message. */
+  /**
+   * Send a pre-compressed image as paced E2EE MLS chunks (stable on WS).
+   * Caller must compress first (see compressImageForSend).
+   */
   const sendImage = useCallback(
     async (bytes: Uint8Array, mime: string, name: string) => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        setError("Not connected — wait a moment or refresh");
+        return false;
+      }
+      if (!mlsRef.current?.state) {
+        setError("Encryption not ready — waiting for MLS group");
+        return false;
+      }
+      if (membersRef.current.length === 0) {
+        setError("Waiting for at least one peer to join");
+        return false;
+      }
+      if (bytes.byteLength > LIMITS.maxImageBytes) {
+        setError("Image too large after compress");
+        return false;
+      }
+
+      const transferId = generateMessageId();
+      const mode = ttlModeRef.current;
+      let frames: string[];
       try {
-        const payload = encodeAppImage(mime, name, bytes);
-        return await sendAppPayload(payload);
+        frames = encodeAppImageChunks(transferId, mime, name, bytes);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Failed to prepare image");
+        return false;
+      }
+
+      try {
+        for (let i = 0; i < frames.length; i++) {
+          const frame = frames[i]!;
+          const wireId = i === 0 ? transferId : `${transferId}_${i}`;
+          const ok = await enqueueMls(async () => {
+            const session = mlsRef.current;
+            const sock = wsRef.current;
+            if (!session?.state || !sock || sock.readyState !== WebSocket.OPEN) {
+              return false;
+            }
+            const enc = await encryptApp(session, frame);
+            persistMls(enc.session);
+            sock.send(
+              JSON.stringify({
+                v: PROTOCOL_VERSION,
+                type: "message",
+                ciphertext: enc.ciphertextB64,
+                nonce: MLS_NONCE_MARKER,
+                ttlMode: mode,
+                messageId: wireId,
+              })
+            );
+            return true;
+          });
+          if (!ok) {
+            setError("Disconnected while sending image");
+            return false;
+          }
+          // Pace under server maxMessagesPerSecond
+          if (i < frames.length - 1) {
+            await new Promise((r) =>
+              setTimeout(r, LIMITS.imageChunkSendGapMs)
+            );
+          }
+        }
+
+        // Show locally once all chunks are out (same transfer id peers will use)
+        const fromId = myIdRef.current ?? "You";
+        appendImageMessage(
+          { id: transferId, from: fromId, mine: true, ttlMode: mode },
+          { mime, name, bytes }
+        );
+        setMeTyping(false);
+        lastTypingSent.current = false;
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          wsRef.current.send(
+            JSON.stringify({
+              v: PROTOCOL_VERSION,
+              type: "typing",
+              state: false,
+            })
+          );
+        }
+        setError(null);
+        return true;
       } catch (e) {
         setError(e instanceof Error ? e.message : "Failed to send image");
         return false;
       }
     },
-    [sendAppPayload]
+    [appendImageMessage, persistMls, enqueueMls]
   );
 
   /** Send an animated ASCII emote by id. */
@@ -984,6 +1170,7 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
     burnAllMessages();
     clearBurnTimers();
     clearKpRetries();
+    imageAssembler.current.clear();
     if (typingTimer.current) clearTimeout(typingTimer.current);
     const rid = roomIdRef.current;
     clearRoomSession(rid);

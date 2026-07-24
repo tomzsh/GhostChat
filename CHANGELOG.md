@@ -2,6 +2,22 @@
 
 All notable changes to GhostChat are documented in this file.
 
+## [2.5.1] — 2026-07-24
+
+### Fixed
+- **Invite code rotation on leave**: rotate before `peer_left`, include
+  `publicCode` on the leave frame; client locks WS to server `internalId`
+  and maps rotated public codes in sessionStorage so reconnects survive
+  multi-rotation + Next soft-nav
+
+### Changed
+- **Image size**: compressed images up to **1MB** (was ~280KB); wire
+  ciphertext limit raised; protocol parser accepts larger MLS app payloads
+- **Images always JPEG-compressed** client-side before send (quality + edge
+  ladder; transparent PNG → white background)
+- **Chunked image transfer** (`GCIMGC1`): split into ~24KB E2EE frames with
+  paced send under rate limits; peers reassemble then show once complete
+
 ## [2.5.0] — 2026-07-24
 
 ### Added
@@ -11,8 +27,8 @@ All notable changes to GhostChat are documented in this file.
 ## [2.4.0] — 2026-07-24
 
 ### Added
-- **Ephemeral images**: compress client-side (≤~280KB JPEG), E2EE via MLS app
-  payload, preview in chat; burns with message TTL / on_leave / leave
+- **Ephemeral images**: compress client-side (≤~1MB JPEG after 2.5.1), E2EE via
+  MLS app payload, preview in chat; burns with message TTL / on_leave / leave
 
 ## [2.3.0] — 2026-07-24
 

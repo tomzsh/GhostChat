@@ -72,6 +72,44 @@ describe("app image payload", () => {
     }
     assert.equal(decodeAppPayload("hello").kind, "text");
   });
+
+  it("splits and reassembles chunked images", async () => {
+    const {
+      encodeAppImageChunks,
+      decodeAppPayload,
+      ImageTransferAssembler,
+    } = await import("./index.ts");
+    // ~50KB so multiple 24KB chunks
+    const bytes = new Uint8Array(50_000);
+    for (let i = 0; i < bytes.length; i++) bytes[i] = i & 0xff;
+    const frames = encodeAppImageChunks("m_testimg01", "image/jpeg", "x.jpg", bytes);
+    assert.ok(frames.length >= 2);
+
+    const asm = new ImageTransferAssembler();
+    let complete: ReturnType<ImageTransferAssembler["ingest"]> | null = null;
+    for (const frame of frames) {
+      const decoded = decodeAppPayload(frame);
+      assert.equal(decoded.kind, "image_part");
+      if (decoded.kind !== "image_part") continue;
+      complete = asm.ingest({
+        id: decoded.id,
+        i: decoded.i,
+        n: decoded.n,
+        mime: decoded.mime,
+        name: decoded.name,
+        len: decoded.len,
+        data: decoded.data,
+      });
+    }
+    assert.ok(complete);
+    assert.equal(complete!.status, "complete");
+    if (complete!.status === "complete") {
+      assert.equal(complete.mime, "image/jpeg");
+      assert.equal(complete.name, "x.jpg");
+      assert.equal(complete.bytes.byteLength, bytes.byteLength);
+      assert.deepEqual(complete.bytes, bytes);
+    }
+  });
 });
 
 describe("app emoji payload", () => {

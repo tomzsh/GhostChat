@@ -1,4 +1,4 @@
-import type { TtlMode } from "@ghostchat/shared";
+import { LIMITS, type TtlMode } from "@ghostchat/shared";
 
 /** Wire protocol major version — v2 = MLS group E2EE. */
 export const PROTOCOL_VERSION = 2 as const;
@@ -90,6 +90,10 @@ export type ServerMessage =
       /** @deprecated first peer only — use peers[] */
       peerId: string | null;
       peerPublicKey: string | null;
+      /** Stable Durable Object / WS id (does not rotate). */
+      internalId?: string;
+      /** Current shareable invite code (may differ from internalId). */
+      publicCode?: string;
     }
   | {
       v: typeof PROTOCOL_VERSION;
@@ -103,6 +107,8 @@ export type ServerMessage =
       type: "peer_left";
       peerId: string;
       participantCount: number;
+      /** New invite code after rotation (remaining peers only). */
+      publicCode?: string;
     }
   /** Invite code rotated after a member left — remaining peers update share/QR. */
   | {
@@ -212,7 +218,7 @@ export function parseClientMessage(raw: unknown): ClientMessage | null {
       };
     case "message":
       if (
-        !isNonEmptyString(msg.ciphertext, 96_000) ||
+        !isNonEmptyString(msg.ciphertext, LIMITS.maxCiphertextBytes) ||
         typeof msg.nonce !== "string" ||
         typeof msg.ttlMode !== "string" ||
         typeof msg.messageId !== "string"

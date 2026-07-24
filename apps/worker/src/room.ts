@@ -42,7 +42,9 @@ const ALARM_IDLE = "idle";
 const ALARM_MAX_AGE = "max_age";
 
 function isLiveAttachment(a: Attachment | null | undefined): a is Attachment {
-  return !!a && !a.sessionToken.endsWith("__replaced");
+  if (!a) return false;
+  const t = a.sessionToken;
+  return !t.endsWith("__replaced") && !t.endsWith("__gone");
 }
 
 function isValidJoinPublicKey(pk: string): boolean {
@@ -423,6 +425,7 @@ export class RoomDurableObject implements DurableObject {
     const participantCount = this.uniqueSessions().size;
     const first = peers[0] ?? null;
 
+    const publicCode = this.publicCode || this.roomId;
     this.send(ws, {
       v: PROTOCOL_VERSION,
       type: "joined",
@@ -433,13 +436,15 @@ export class RoomDurableObject implements DurableObject {
       peers,
       peerId: first?.id ?? null,
       peerPublicKey: first?.publicKey ?? null,
+      internalId: this.roomId,
+      publicCode,
     });
 
     // Always tell joiner the current public invite code (may differ after rotates)
     this.send(ws, {
       v: PROTOCOL_VERSION,
       type: "room_code",
-      publicCode: this.publicCode || this.roomId,
+      publicCode,
     });
 
     for (const peerWs of this.joinedPeers(ws)) {
@@ -565,7 +570,7 @@ export class RoomDurableObject implements DurableObject {
     attachment.messageTimestamps.push(now);
     this.setAttachment(ws, attachment);
 
-    if (msg.ciphertext.length > LIMITS.maxCiphertextBytes * 2) {
+    if (msg.ciphertext.length > LIMITS.maxCiphertextBytes) {
       this.send(ws, {
         v: PROTOCOL_VERSION,
         type: "error",
@@ -607,12 +612,20 @@ export class RoomDurableObject implements DurableObject {
     if (this.isAlias) return;
     const att = this.getAttachment(ws);
     if (!att) return;
-    if (att.sessionToken.endsWith("__replaced")) return;
+    if (
+      att.sessionToken.endsWith("__replaced") ||
+      att.sessionToken.endsWith("__gone")
+    ) {
+      return;
+    }
 
+    // Another live socket still holds this session (reconnect / Strict Mode)
     for (const s of this.state.getWebSockets()) {
       if (s === ws) continue;
       const a = this.getAttachment(s);
-      if (a && a.sessionToken === att.sessionToken) return;
+      if (a && a.sessionToken === att.sessionToken && isLiveAttachment(a)) {
+        return;
+      }
     }
 
     const leftId = att.displayId;
@@ -625,6 +638,12 @@ export class RoomDurableObject implements DurableObject {
 
     const participantCount = this.uniqueSessions().size;
 
+    // Rotate invite BEFORE notifying peers so peer_left can carry the new code
+    let newPublic: string | undefined;
+    if (participantCount > 0) {
+      newPublic = (await this.rotatePublicCode()) ?? undefined;
+    }
+
     this.broadcast(
       ws,
       {
@@ -632,33 +651,49 @@ export class RoomDurableObject implements DurableObject {
         type: "peer_left",
         peerId: leftId,
         participantCount,
+        ...(newPublic ? { publicCode: newPublic } : {}),
       },
       true
     );
+
+    if (newPublic) {
+      this.broadcast(
+        null,
+        {
+          v: PROTOCOL_VERSION,
+          type: "room_code",
+          publicCode: newPublic,
+        },
+        false
+      );
+    }
 
     if (participantCount === 0) {
       await this.state.storage.put("emptySince", Date.now());
       await this.state.storage.setAlarm(Date.now() + LIMITS.reconnectGraceMs);
       await this.state.storage.put("alarmKind", "empty");
-    } else {
-      // Someone left but room still live → rotate invite code
-      await this.rotatePublicCode();
     }
   }
 
-  /** Invalidate old invite code; publish a new one to remaining members. */
-  private async rotatePublicCode() {
-    if (!this.env?.ROOMS || this.isAlias || !this.roomId) return;
+  /**
+   * Invalidate old invite code; register alias DO for the new one.
+   * Returns the new public code, or null if rotation failed.
+   */
+  private async rotatePublicCode(): Promise<string | null> {
+    if (this.isAlias || !this.roomId) return null;
+    const rooms = this.env?.ROOMS;
+    if (!rooms) {
+      console.error("[ghostchat] rotatePublicCode: ROOMS binding missing");
+      return null;
+    }
 
     let newCode: string | null = null;
     // Try several codes — collide with live rooms or busy alias slots
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 16; i++) {
       const candidate = generateRoomId();
       if (candidate === this.roomId || candidate === this.publicCode) continue;
       try {
-        const aliasStub = this.env.ROOMS.get(
-          this.env.ROOMS.idFromName(candidate)
-        );
+        const aliasStub = rooms.get(rooms.idFromName(candidate));
         const res = await aliasStub.fetch("https://do/init-alias", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -668,19 +703,20 @@ export class RoomDurableObject implements DurableObject {
           newCode = candidate;
           break;
         }
-      } catch {
-        /* try next */
+      } catch (err) {
+        console.error("[ghostchat] init-alias failed", candidate, err);
       }
     }
-    if (!newCode) return;
+    if (!newCode) {
+      console.error("[ghostchat] rotatePublicCode: could not claim alias");
+      return null;
+    }
 
     const oldPublic = this.publicCode;
     // Clear previous alias (if it was not the primary DO name)
     if (oldPublic && oldPublic !== this.roomId) {
       try {
-        const oldAlias = this.env.ROOMS.get(
-          this.env.ROOMS.idFromName(oldPublic)
-        );
+        const oldAlias = rooms.get(rooms.idFromName(oldPublic));
         await oldAlias.fetch("https://do/clear-alias", { method: "POST" });
       } catch {
         /* ignore */
@@ -696,15 +732,7 @@ export class RoomDurableObject implements DurableObject {
       maxParticipants: this.maxParticipants,
     } satisfies RoomMeta);
 
-    this.broadcast(
-      null,
-      {
-        v: PROTOCOL_VERSION,
-        type: "room_code",
-        publicCode: this.publicCode,
-      },
-      false
-    );
+    return newCode;
   }
 
   private uniqueSessions(except?: WebSocket): Set<string> {

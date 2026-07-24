@@ -368,7 +368,14 @@ async function runSession(roomId: string, defaultTtl: TtlMode) {
         participantCount = msg.participantCount ?? members.size + 1;
         ui.warn(`peer left · ${msg.peerId}`);
         burnOnLeaveFrom(msg.peerId, `peer left · ${msg.peerId}`);
-        // room_code frame follows from server when others remain
+        // Invite rotation (also arrives as room_code)
+        const rotated = String(msg.publicCode ?? "")
+          .trim()
+          .toUpperCase();
+        if (rotated && rotated !== publicCode) {
+          publicCode = rotated;
+          ui.warn(`invite code rotated → ${ui.c.brightGreen(publicCode)}`);
+        }
         if (mls?.state) {
           await enqueueMls(async () => {
             if (

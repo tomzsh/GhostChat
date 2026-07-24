@@ -634,7 +634,7 @@ export function RoomChat({ roomId }: { roomId: string }) {
               disabled={!canSend || sendingImage}
               className="chip !min-h-11 shrink-0 touch-manipulation px-2.5 text-[12px] disabled:opacity-40"
               aria-label="Send image"
-              title="Send compressed image (E2EE)"
+              title="Compress + send image (E2EE, ≤1MB, chunked)"
             >
               {sendingImage ? "…" : "img"}
             </button>

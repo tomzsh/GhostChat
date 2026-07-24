@@ -1,5 +1,10 @@
 /** sessionStorage only — never localStorage (ephemeral identity) */
-import { generateDisplayId, randomChars } from "@ghostchat/shared";
+import {
+  generateDisplayId,
+  isValidRoomId,
+  normalizeRoomId,
+  randomChars,
+} from "@ghostchat/shared";
 
 const PREFIX = "ghostchat:";
 
@@ -54,7 +59,49 @@ export function getOrCreateDisplayId(roomId: string): string {
   return id;
 }
 
+/**
+ * Map a public invite code → stable internal WS/DO id for this tab.
+ * Survives code rotation + Next soft-nav remounts.
+ */
+export function rememberWsInternal(publicCode: string, internalId: string): void {
+  const pub = normalizeRoomId(publicCode);
+  const internal = normalizeRoomId(internalId);
+  if (!isValidRoomId(pub) || !isValidRoomId(internal)) return;
+  sessionSet(`wsInternal:${pub}`, internal);
+  // Also pin the internal id to itself
+  sessionSet(`wsInternal:${internal}`, internal);
+}
+
+/** Resolve URL/join code to the stable WS room id if we already know it. */
+export function resolveWsInternal(code: string): string {
+  const c = normalizeRoomId(code);
+  if (!isValidRoomId(c)) return c;
+  const mapped = sessionGet(`wsInternal:${c}`);
+  if (mapped && isValidRoomId(mapped)) return mapped;
+  return c;
+}
+
+/** Copy session + display keys when we learn the true internal id. */
+export function migrateRoomIdentity(fromCode: string, toInternal: string): void {
+  const from = normalizeRoomId(fromCode);
+  const to = normalizeRoomId(toInternal);
+  if (!isValidRoomId(from) || !isValidRoomId(to) || from === to) return;
+  const tok = sessionGet(`session:${from}`);
+  if (tok) sessionSet(`session:${to}`, tok);
+  const disp = sessionGet(`display:${from}`);
+  if (disp) sessionSet(`display:${to}`, disp);
+  rememberWsInternal(from, to);
+}
+
 export function clearRoomSession(roomId: string): void {
-  sessionRemove(`session:${roomId}`);
-  sessionRemove(`display:${roomId}`);
+  const id = normalizeRoomId(roomId);
+  const internal = resolveWsInternal(id);
+  sessionRemove(`session:${id}`);
+  sessionRemove(`display:${id}`);
+  sessionRemove(`wsInternal:${id}`);
+  if (internal !== id) {
+    sessionRemove(`session:${internal}`);
+    sessionRemove(`display:${internal}`);
+    sessionRemove(`wsInternal:${internal}`);
+  }
 }

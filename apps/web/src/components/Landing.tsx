@@ -202,7 +202,8 @@ export function Landing() {
               old links stop working for new joiners.
             </li>
             <li>
-              Optional <strong className="text-white">images</strong> (compressed, E2EE) — no
+              Optional <strong className="text-white">images</strong> (≤1MB
+              compressed, E2EE) — no
               server storage.
             </li>
             <li>
