@@ -32,12 +32,34 @@ const joinLimiter = new SlidingWindowLimiter(
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+      ...CORS_HEADERS,
+    },
   });
 }
 
 function rateLimited(): Response {
   return json({ error: "rate_limited", code: "rate_limited" }, 429);
+}
+
+/** Prefer env PUBLIC_WS_ORIGIN, but ignore localhost/127.0.0.1 on public hosts. */
+function resolvePublicWsOrigin(request: Request, env: Env): string {
+  const url = new URL(request.url);
+  const fromRequest = `${url.protocol === "https:" ? "wss" : "ws"}://${url.host}`;
+  const configured = (env.PUBLIC_WS_ORIGIN || "").replace(/\/$/, "").trim();
+  if (!configured) return fromRequest;
+  // Deployed worker with leftover local wrangler var — use request host instead
+  if (/127\.0\.0\.1|localhost/i.test(configured) && url.hostname !== "127.0.0.1") {
+    return fromRequest;
+  }
+  // Force wss when client hit us over https
+  if (url.protocol === "https:" && configured.startsWith("ws://")) {
+    return configured.replace(/^ws:\/\//i, "wss://");
+  }
+  return configured;
 }
 
 function getRoomStub(env: Env, roomId: string): DurableObjectStub {
@@ -174,14 +196,12 @@ export default {
         body: JSON.stringify({ roomId, maxParticipants }),
       });
 
-      const host = url.host;
-      const wsOrigin =
-        env.PUBLIC_WS_ORIGIN ||
-        `${url.protocol === "https:" ? "wss" : "ws"}://${host}`;
+      // Never advertise loopback in production (wrangler.toml often has local default)
+      const wsOrigin = resolvePublicWsOrigin(request, env);
 
       return json({
         roomId,
-        wsUrl: `${wsOrigin.replace(/\/$/, "")}/ws/${roomId}`,
+        wsUrl: `${wsOrigin}/ws/${roomId}`,
         maxParticipants,
       });
     }

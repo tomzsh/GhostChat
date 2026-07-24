@@ -19,5 +19,7 @@ tag = "v1"
 new_classes = ["RoomDurableObject"]
 
 [vars]
-# Public origin used to build wsUrl in create response (override in production)
+# Used only for local `wrangler dev`. Production deploy must pass
+# --var PUBLIC_WS_ORIGIN:wss://<your-worker>.workers.dev
+# (loopback is ignored automatically when the request host is public).
 PUBLIC_WS_ORIGIN = "ws://127.0.0.1:8787"

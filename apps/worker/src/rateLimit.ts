@@ -37,10 +37,19 @@ export class SlidingWindowLimiter {
   }
 }
 
+/**
+ * Best-effort client IP.
+ * Prefer X-Forwarded-For when present (Vercel → Worker), else CF edge IP.
+ */
 export function clientIp(request: Request): string {
+  const xff = request.headers.get("x-forwarded-for");
+  if (xff) {
+    const first = xff.split(",")[0]?.trim();
+    if (first) return first;
+  }
   return (
     request.headers.get("cf-connecting-ip") ||
-    request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
+    request.headers.get("true-client-ip") ||
     request.headers.get("x-real-ip") ||
     "unknown"
   );

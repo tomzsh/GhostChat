@@ -31,11 +31,15 @@ const nextConfig: NextConfig = {
   // Proxy REST to the worker so the browser can call /api/* same-origin.
   // WebSocket still connects to the worker host directly (see getWsUrl).
   async rewrites() {
+    // Prefer /api/health (current worker). Also rewrite legacy path if clients call it.
     return [
       {
-        // Prefer canonical /api/health on worker; /health kept for older deploys
         source: "/api/health",
         destination: `${workerOrigin}/api/health`,
+      },
+      {
+        source: "/health",
+        destination: `${workerOrigin}/health`,
       },
       {
         source: "/api/rooms",
