@@ -75,6 +75,7 @@ Clients: **Web (Next.js)** and **CLI (`ghost`)** share the same Cloudflare Worke
 - QR join, copy / native share of room code
 - Close-room modal (ASCII terminal style)
 - Relay health indicator on landing
+- **PWA** — installable shell (service worker caches UI only, never chat/API)
 - Polished terminal CLI UI
 
 ### Infrastructure

@@ -9,6 +9,7 @@ import {
   clampMaxParticipants,
 } from "@ghostchat/shared";
 import { createRoom, getRoomStatus } from "@/lib/api";
+import { InstallHint } from "./InstallHint";
 import { RelayStatus } from "./RelayStatus";
 import { TerminalFrame } from "./TerminalFrame";
 
@@ -85,7 +86,10 @@ export function Landing() {
         <div>
           <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
             <p className="text-xs text-ghost-green sm:text-sm">$ ghostchat</p>
-            <RelayStatus />
+            <div className="flex flex-wrap items-center gap-1.5">
+              <InstallHint />
+              <RelayStatus />
+            </div>
           </div>
           <h1 className="text-[1.35rem] font-semibold leading-tight tracking-tight text-white sm:text-3xl">
             Anonymous.

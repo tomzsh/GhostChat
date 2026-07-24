@@ -75,6 +75,7 @@ Klien: **Web (Next.js)** dan **CLI (`ghost`)** memakai backend Cloudflare Worker
 - QR join, salin / share native kode room
 - Modal tutup room bergaya terminal ASCII
 - Indikator kesehatan relay di landing
+- **PWA** — bisa di-install (service worker cache UI saja, bukan chat/API)
 - UI CLI bergaya terminal
 
 ### Infrastruktur

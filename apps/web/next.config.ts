@@ -48,7 +48,9 @@ const securityHeaders: { key: string; value: string }[] = [
       "font-src 'self' data:",
       `connect-src ${cspConnectSrc}`,
       "media-src 'self' blob:",
+      // Service worker + Next workers
       "worker-src 'self' blob:",
+      "manifest-src 'self'",
       "object-src 'none'",
       "base-uri 'self'",
       "form-action 'self'",
