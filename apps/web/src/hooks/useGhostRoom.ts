@@ -1398,6 +1398,8 @@ export function useGhostRoom({ roomId, defaultTtl = "60s" }: Options) {
   const canSendUi =
     !!safetyNumber &&
     members.length > 0 &&
+    !mediaSendLock.current &&
+    !transferProgress &&
     state !== "error" &&
     state !== "closed" &&
     state !== "connecting";
